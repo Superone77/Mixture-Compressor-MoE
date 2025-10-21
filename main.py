@@ -172,8 +172,12 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                     gptq[name].wbits = args.wbits
                 else:
                     if name not in expert_modules:
-                        gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                        gptq[name].wbits = args.attn_bits
+                        # Skip quantization for attention layers if attn_bits is bf16
+                        if args.attn_bits == "bf16":
+                            gptq[name].wbits = "bf16"
+                        else:
+                            gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = args.attn_bits
                     else:
                         if name[:-3] in high_bit_experts:
                             gptq[name].quantizer.configure(args.wbits+1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
@@ -198,6 +202,13 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 h.remove()
 
             for name in subset:
+                # Skip quantization if wbits is bf16 (no quantization)
+                if gptq[name].wbits == "bf16":
+                    print(f'|{name:^32}|{"bf16(skip)":^12}|{"N/A":^12}|{"N/A":^12}|{"N/A":^9}|')
+                    quantizers['model.layers.%d.%s' % (i, name)] = None
+                    gptq[name].free()
+                    continue
+                
                 scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
                 # quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), args.wbits, args.groupsize)
                 quantizers['model.layers.%d.%s' % (i, name)] = None
@@ -256,8 +267,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--attn_bits",
         type=str,
-        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit"],
-        help="attention weight bit-width",
+        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit", "bf16"],
+        help="attention weight bit-width, or bf16 for no quantization",
     )
     parser.add_argument(
         "--dataset",
@@ -367,7 +378,11 @@ if __name__ == "__main__":
 
     groupsize = args.groupsize
     args.wbits = int(args.wbits[0])
-    args.attn_bits = int(args.attn_bits[0])
+    # Handle bf16 for attention bits (no quantization)
+    if args.attn_bits == "bf16":
+        args.attn_bits = "bf16"
+    else:
+        args.attn_bits = int(args.attn_bits[0])
 
     model = get_model()
     model.eval()
@@ -409,7 +424,8 @@ if __name__ == "__main__":
             print("Time: ", time.time() - t1)
     if args.save:
         average_bits = int(args.precisions[-9:-7])/8
-        saving_path = args.saving_path + f"Mixtral-8x7B-v0.1-atten_{args.attn_bits}-e_{average_bits}"
+        attn_str = args.attn_bits if args.attn_bits == "bf16" else str(args.attn_bits)
+        saving_path = args.saving_path + f"Mixtral-8x7B-v0.1-atten_{attn_str}-e_{average_bits}"
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         tokenizer.save_pretrained(saving_path)
         from utils.pack import save_quantized
