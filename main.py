@@ -4,7 +4,7 @@ import time
 import torch
 import logging
 import torch.nn as nn
-from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM
+from mixtral_model.modeling_mixtral import MixtralForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 from gptq import GPTQ
@@ -60,7 +60,7 @@ def get_model():
     config = AutoConfig.from_pretrained(
         args.model, attn_implementation=args.attn_implementation
     )
-    model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
+    model = MixtralForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
 
     assert isinstance(
         model, MixtralForCausalLM), 'Successfully loaded `Mixtral` model!'
