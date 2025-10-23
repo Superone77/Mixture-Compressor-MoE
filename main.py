@@ -423,10 +423,10 @@ if __name__ == "__main__":
     # Check if both wbits and attn_bits are bf16 (no quantization needed)
     if args.wbits == "bf16" and args.attn_bits == "bf16":
         print("Both wbits and attn_bits are bf16, skipping quantization...")
-        # Convert model to float32 for CPU evaluation (CPU doesn't support float16)
-        model = model.float()
+        # Keep model on GPU for evaluation
+        model = model.to(device)
         quantizers = {}
-        print("Skipped quantization - model converted to float32 for CPU evaluation")
+        print("Skipped quantization - model kept on GPU for evaluation")
     else:
         tick = time.time()
         quantizers = mixtral_sequential(model, dataloader, device, bit_config)
@@ -437,7 +437,7 @@ if __name__ == "__main__":
     if args.eval_ppl:
         from eval_utils import tasks_evaluate
         t1 = time.time()
-        # Use CPU for evaluation if both wbits and attn_bits are bf16
+        # Use GPU for evaluation
         eval_device = device
         # Parse tasks string into list
         tasks_list = [task.strip() for task in args.tasks.split(',') if task.strip()]
