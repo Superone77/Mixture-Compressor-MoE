@@ -21,6 +21,9 @@ def test_full_precision_ppl(model_path, dataset="wikitext2", batch_size=1):
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
+    # Add seqlen attribute for compatibility with llama_eval
+    model.seqlen = 2048
+    
     # Get data loader
     print(f"Loading {dataset} dataset...")
     dataloader, testloader = get_loaders(dataset, seed=0, seqlen=2048)
@@ -28,7 +31,25 @@ def test_full_precision_ppl(model_path, dataset="wikitext2", batch_size=1):
     # Evaluate perplexity
     print("Evaluating perplexity...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    llama_eval(model, testloader, device, dataset)
+    
+    # Create a wrapper to handle Mixtral-specific parameters
+    class MixtralWrapper:
+        def __init__(self, model):
+            self.model = model
+            self.seqlen = 2048
+            self.config = model.config
+            
+        def __call__(self, input_ids, attention_mask=None, **kwargs):
+            # Generate position_ids for Mixtral
+            batch_size, seq_len = input_ids.shape
+            position_ids = torch.arange(0, seq_len, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+            
+            return self.model(input_ids, attention_mask=attention_mask, position_ids=position_ids)
+    
+    # Wrap the model
+    wrapped_model = MixtralWrapper(model)
+    llama_eval(wrapped_model, testloader, device, dataset)
     
     print(f"Full precision Mixtral-8x7B evaluation on {dataset} completed")
     
