@@ -168,8 +168,12 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 gptq[name] = GPTQ(subset[name], logger, name, args.wbits)
 
                 if args.mixed_type == "uniform":
-                    gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
-                    gptq[name].wbits = args.wbits
+                    # Skip quantization if wbits is bf16 (no quantization)
+                    if args.wbits == "bf16":
+                        gptq[name].wbits = "bf16"
+                    else:
+                        gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
+                        gptq[name].wbits = args.wbits
                 else:
                     if name not in expert_modules:
                         # Skip quantization for attention layers if attn_bits is bf16
@@ -179,15 +183,19 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                             gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                             gptq[name].wbits = args.attn_bits
                     else:
-                        if name[:-3] in high_bit_experts:
-                            gptq[name].quantizer.configure(args.wbits+1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits+1
-                        elif name[:-3] in low_bit_experts:
-                            gptq[name].quantizer.configure(args.wbits-1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits-1
+                        # Skip quantization if wbits is bf16 (no quantization)
+                        if args.wbits == "bf16":
+                            gptq[name].wbits = "bf16"
                         else:
-                            gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits
+                            if name[:-3] in high_bit_experts:
+                                gptq[name].quantizer.configure(args.wbits+1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                                gptq[name].wbits = args.wbits+1
+                            elif name[:-3] in low_bit_experts:
+                                gptq[name].quantizer.configure(args.wbits-1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                                gptq[name].wbits = args.wbits-1
+                            else:
+                                gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                                gptq[name].wbits = args.wbits
             # print(layer)
             def add_batch(name):
                 def tmp(_, inp, out):
@@ -261,8 +269,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wbits",
         type=str,
-        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit"],
-        help="weight bit-width",
+        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit", "bf16"],
+        help="weight bit-width, or bf16 for no quantization",
     )
     parser.add_argument(
         "--attn_bits",
@@ -377,7 +385,11 @@ if __name__ == "__main__":
     print(f'Arguments: {args}')
 
     groupsize = args.groupsize
-    args.wbits = int(args.wbits[0])
+    # Handle bf16 for wbits (no quantization)
+    if args.wbits == "bf16":
+        args.wbits = "bf16"
+    else:
+        args.wbits = int(args.wbits[0])
     # Handle bf16 for attention bits (no quantization)
     if args.attn_bits == "bf16":
         args.attn_bits = "bf16"
@@ -425,7 +437,8 @@ if __name__ == "__main__":
     if args.save:
         average_bits = int(args.precisions[-9:-7])/8
         attn_str = args.attn_bits if args.attn_bits == "bf16" else str(args.attn_bits)
-        saving_path = args.saving_path + f"Mixtral-8x7B-v0.1-atten_{attn_str}-e_{average_bits}"
+        wbits_str = args.wbits if args.wbits == "bf16" else str(args.wbits)
+        saving_path = args.saving_path + f"Mixtral-8x7B-v0.1-wbits_{wbits_str}-atten_{attn_str}-e_{average_bits}"
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         tokenizer.save_pretrained(saving_path)
         from utils.pack import save_quantized
