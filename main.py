@@ -340,8 +340,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tasks", 
         type=str,
-        default="",
-        help="Test datasets",
+        default="wikitext2",
+        help="Test datasets (comma-separated list of tasks for lm_eval)",
     )
     parser.add_argument(
         "--save",
@@ -435,17 +435,14 @@ if __name__ == "__main__":
     print(model)
 
     if args.eval_ppl:
-        for dataset in ["wikitext2"]:#, "c4", "ptb"]:
-            dataloader, testloader = get_loaders(
-                dataset, seed=args.seed, seqlen=2048, model=args.model
-            )
-            print(dataset)
-            from eval_ppl_utils import llama_eval
-            t1 = time.time()
-            # Use CPU for evaluation if both wbits and attn_bits are bf16
-            eval_device = "cpu" if (args.wbits == "bf16" and args.attn_bits == "bf16") else device
-            llama_eval(model, testloader, eval_device, dataset)
-            print("Time: ", time.time() - t1)
+        from eval_utils import tasks_evaluate
+        t1 = time.time()
+        # Use CPU for evaluation if both wbits and attn_bits are bf16
+        eval_device = device
+        # Parse tasks string into list
+        tasks_list = [task.strip() for task in args.tasks.split(',') if task.strip()]
+        tasks_evaluate(model, tasks_list, args.batch_size, eval_device)
+        print("Time: ", time.time() - t1)
     if args.save:
         average_bits = int(args.precisions[-9:-7])/8
         attn_str = args.attn_bits if args.attn_bits == "bf16" else str(args.attn_bits)
