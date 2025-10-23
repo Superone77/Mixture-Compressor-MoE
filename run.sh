@@ -4,6 +4,12 @@ Model_Path="/local/mnt2/workspace/wanqi/tmp/AI-ModelScope/Mixtral-8x7B-v0.1"
 Saving_Path="/local/mnt2/workspace/wanqi/tmp/AI-ModelScope/Mixtral-8x7B-v0.1-2.5b"
 Precision_Path="./experts_mixture_bit_selection/experts_mixture_bitwidth_combination_20bit.pkl"
 
+# Test full precision model first
+echo "Testing full precision Mixtral-8x7B on wikitext2..."
+python test_full_precision.py ${Model_Path} --dataset wikitext2
+
+echo "Full precision test completed. Now running quantization..."
+
 # Example 1: Use bf16 for attention layers (no quantization)
 python main.py ${Model_Path} --wbits 2bit --attn_bits bf16 --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type uniform --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
 
