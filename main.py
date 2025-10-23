@@ -441,7 +441,9 @@ if __name__ == "__main__":
         eval_device = device
         # Parse tasks string into list
         tasks_list = [task.strip() for task in args.tasks.split(',') if task.strip()]
-        tasks_evaluate(model, tasks_list, args.batch_size, eval_device)
+        # Load tokenizer for evaluation
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tasks_evaluate(model, tokenizer, tasks_list, args.batch_size, eval_device)
         print("Time: ", time.time() - t1)
     if args.save:
         average_bits = int(args.precisions[-9:-7])/8

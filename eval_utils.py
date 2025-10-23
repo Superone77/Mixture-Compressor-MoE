@@ -18,6 +18,7 @@ import torch
 from tqdm import tqdm
 
 from lm_eval import evaluator
+from lm_eval.models.huggingface import HFLM
 
 def make_table(result_dict):
     """Generate table of results."""
@@ -53,15 +54,24 @@ def make_table(result_dict):
     return md_writer.dumps()
 
 
-def tasks_evaluate(model, tasks, batch_size = 4,device="cuda"):
+def tasks_evaluate(model, tokenizer, tasks, batch_size = 4, device="cuda"):
     result_list = []
     from datetime import datetime
     # 获取当前日期和时间
     now = datetime.now()
+    
+    # Wrap the HuggingFace model with HFLM
+    lm = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        device=device
+    )
+    
     for task in tasks:
         filename_safe = now.strftime("%Y%m%d_%H%M%S")  # 20240405_153045
         # sample = {task:[0,1,2,3]}
-        result = evaluator.simple_evaluate(model=model,tasks=task,batch_size = batch_size,device=device)
+        result = evaluator.simple_evaluate(model=lm, tasks=task, batch_size=batch_size)
         result_list.append(result)
         print(make_table(result))
     print("---------------final results-----------------")
