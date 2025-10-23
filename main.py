@@ -423,10 +423,9 @@ if __name__ == "__main__":
     # Check if both wbits and attn_bits are bf16 (no quantization needed)
     if args.wbits == "bf16" and args.attn_bits == "bf16":
         print("Both wbits and attn_bits are bf16, skipping quantization...")
-        # Move model to device for evaluation
-        model = model.to(device)
+        # Keep model on CPU, let evaluation function handle device management
         quantizers = {}
-        print("Skipped quantization - model remains in bf16 precision")
+        print("Skipped quantization - model remains in bf16 precision on CPU")
     else:
         tick = time.time()
         quantizers = mixtral_sequential(model, dataloader, device, bit_config)
@@ -442,7 +441,9 @@ if __name__ == "__main__":
             print(dataset)
             from eval_ppl_utils import llama_eval
             t1 = time.time()
-            llama_eval(model, testloader, device, dataset)
+            # Use CPU for evaluation if both wbits and attn_bits are bf16
+            eval_device = "cpu" if (args.wbits == "bf16" and args.attn_bits == "bf16") else device
+            llama_eval(model, testloader, eval_device, dataset)
             print("Time: ", time.time() - t1)
     if args.save:
         average_bits = int(args.precisions[-9:-7])/8
