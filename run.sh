@@ -8,7 +8,7 @@ Precision_Path="./experts_mixture_bit_selection/experts_mixture_bitwidth_combina
 echo "Testing full precision Mixtral-8x7B on wikitext2..."
 
 # Example 1: Use bf16 for attention layers (no quantization)
-python main.py ${Model_Path} --wbits 2bit --attn_bits bf16 --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type uniform --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
+python main.py ${Model_Path} --wbits bf16 --attn_bits bf16 --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type uniform --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
 
 # Example 2: Use 4bit quantization for attention layers
 # python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type uniform --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
