@@ -419,9 +419,19 @@ if __name__ == "__main__":
         seqlen=model.seqlen,
     )
     device = "cuda:0"
-    tick = time.time()
-    quantizers = mixtral_sequential(model, dataloader, device, bit_config)
-    print("quantization time:", time.time() - tick, "s")
+    
+    # Check if both wbits and attn_bits are bf16 (no quantization needed)
+    if args.wbits == "bf16" and args.attn_bits == "bf16":
+        print("Both wbits and attn_bits are bf16, skipping quantization...")
+        # Move model to device for evaluation
+        model = model.to(device)
+        quantizers = {}
+        print("Skipped quantization - model remains in bf16 precision")
+    else:
+        tick = time.time()
+        quantizers = mixtral_sequential(model, dataloader, device, bit_config)
+        print("quantization time:", time.time() - tick, "s")
+    
     print(model)
 
     if args.eval_ppl:
