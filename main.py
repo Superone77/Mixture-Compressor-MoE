@@ -435,16 +435,17 @@ if __name__ == "__main__":
     print(model)
 
     if args.eval_ppl:
-        from eval_utils import tasks_evaluate
-        t1 = time.time()
-        # Use GPU for evaluation
-        eval_device = device
-        # Parse tasks string into list
-        tasks_list = [task.strip() for task in args.tasks.split(',') if task.strip()]
-        # Load tokenizer for evaluation
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-        tasks_evaluate(model, tokenizer, tasks_list, args.batch_size, eval_device)
-        print("Time: ", time.time() - t1)
+        for dataset in ["wikitext2"]:#, "c4", "ptb"]:
+            dataloader, testloader = get_loaders(
+                dataset, seed=args.seed, seqlen=2048, model=args.model
+            )
+            print(dataset)
+            from eval_ppl_utils import llama_eval
+            t1 = time.time()
+            # Use GPU for evaluation
+            eval_device = device
+            llama_eval(model, testloader, eval_device, dataset)
+            print("Time: ", time.time() - t1)
     if args.save:
         average_bits = int(args.precisions[-9:-7])/8
         attn_str = args.attn_bits if args.attn_bits == "bf16" else str(args.attn_bits)
