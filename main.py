@@ -424,7 +424,7 @@ if __name__ == "__main__":
     if args.wbits == "bf16" and args.attn_bits == "bf16":
         print("Both wbits and attn_bits are bf16, skipping quantization...")
         # Keep model on GPU for evaluation
-        model = model.to(device)
+        # model = model.to(device)
         quantizers = {}
         print("Skipped quantization - model kept on GPU for evaluation")
     else:
