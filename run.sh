@@ -12,9 +12,3 @@ python main.py ${Model_Path} --wbits bf16 --attn_bits bf16 --dataset wikitext2 -
 
 # Example 2: Use 4bit quantization for attention layers
 # python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type uniform --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
-
-# Example 3: Run GPTQ calculation only on first 3 layers (0, 1, 2)
-# python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path} --gptq_layers "0,1,2" --pack --save --saving_path ${Saving_Path}
-
-# Example 4: Run GPTQ calculation on layers 0-5
-# python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path} --gptq_layers "0-5" --pack --save --saving_path ${Saving_Path}
