@@ -69,7 +69,7 @@ def get_model():
 
 
 @torch.no_grad()
-def mixtral_sequential(model, dataloader, dev, bit_config=None):
+def mixtral_sequential(model, dataloader, dev, bit_config=None, gptq_layers=None):
     print('Starting ...')
 
     use_cache = model.config.use_cache
@@ -115,6 +115,13 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
     position_ids = cache['position_ids']
     print('Ready.')
     quantizers = {}
+    
+    # Determine which layers to run GPTQ calculation on
+    if gptq_layers is None:
+        gptq_layers = list(range(len(layers)))
+    
+    print(f'Running GPTQ calculation on layers: {gptq_layers}')
+    
     for i in range(len(layers)):
 
         print(f'Quantizing layer {i+1}/{len(layers)}..')
@@ -197,45 +204,58 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                                 gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                                 gptq[name].wbits = args.wbits
             # print(layer)
-            def add_batch(name):
-                def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
-                return tmp
-            handles = []
-            for name in subset:
-                handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-            for h in handles:
-                h.remove()
+            # Only run GPTQ calculation on specified layers
+            if i in gptq_layers:
+                def add_batch(name):
+                    def tmp(_, inp, out):
+                        gptq[name].add_batch(inp[0].data, out.data)
+                    return tmp
+                handles = []
+                for name in subset:
+                    handles.append(subset[name].register_forward_hook(add_batch(name)))
+                for j in range(args.nsamples):
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                for h in handles:
+                    h.remove()
 
-            for name in subset:
-                # Skip quantization if wbits is bf16 (no quantization)
-                if gptq[name].wbits == "bf16":
-                    print(f'|{name:^32}|{"bf16(skip)":^12}|{"N/A":^12}|{"N/A":^12}|{"N/A":^9}|')
+                for name in subset:
+                    # Skip quantization if wbits is bf16 (no quantization)
+                    if gptq[name].wbits == "bf16":
+                        print(f'|{name:^32}|{"bf16(skip)":^12}|{"N/A":^12}|{"N/A":^12}|{"N/A":^9}|')
+                        quantizers['model.layers.%d.%s' % (i, name)] = None
+                        gptq[name].free()
+                        continue
+                    
+                    scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
+                    # quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), args.wbits, args.groupsize)
                     quantizers['model.layers.%d.%s' % (i, name)] = None
+                    if args.pack:
+                        # real quant for compact memory
+                        quant_config = BaseQuantizeConfig(nbits=gptq[name].wbits, group_size=args.groupsize)
+                        name_parts = name.split('.')
+                        if len(name_parts) == 2: # atten layer
+                            _module = getattr(layer, name_parts[-2])
+                            linear_layer = getattr(_module, name_parts[-1])
+                        else: 
+                            experts = getattr(layer.block_sparse_moe, "experts")
+                            _module = experts[int(name_parts[-2])]
+                            linear_layer = getattr(_module, name_parts[-1])
+                        quant_layer = QLinear(quant_config=quant_config, device=linear_layer.weight.device)
+                        quant_layer.replace_quantized_weight(linear_layer.weight, scale, zero)
+                        setattr(_module, name_parts[-1], quant_layer)
+                        print(getattr(_module, name_parts[-1]).W_q.dtype)
                     gptq[name].free()
-                    continue
+            else:
+                # For layers not in gptq_layers, just run forward pass without GPTQ calculation
+                print(f'|{"Skipping GPTQ calculation":^32}|{"N/A":^12}|{"N/A":^12}|{"N/A":^12}|{"N/A":^9}|')
+                for j in range(args.nsamples):
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
                 
-                scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
-                # quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), args.wbits, args.groupsize)
-                quantizers['model.layers.%d.%s' % (i, name)] = None
-                if args.pack:
-                    # real quant for compact memory
-                    quant_config = BaseQuantizeConfig(nbits=gptq[name].wbits, group_size=args.groupsize)
-                    name_parts = name.split('.')
-                    if len(name_parts) == 2: # atten layer
-                        _module = getattr(layer, name_parts[-2])
-                        linear_layer = getattr(_module, name_parts[-1])
-                    else: 
-                        experts = getattr(layer.block_sparse_moe, "experts")
-                        _module = experts[int(name_parts[-2])]
-                        linear_layer = getattr(_module, name_parts[-1])
-                    quant_layer = QLinear(quant_config=quant_config, device=linear_layer.weight.device)
-                    quant_layer.replace_quantized_weight(linear_layer.weight, scale, zero)
-                    setattr(_module, name_parts[-1], quant_layer)
-                    print(getattr(_module, name_parts[-1]).W_q.dtype)
-                gptq[name].free()
+                # Still need to set quantizers for consistency
+                for name in subset:
+                    quantizers['model.layers.%d.%s' % (i, name)] = None
+                    if gptq[name].wbits != "bf16":
+                        gptq[name].free()
             
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
@@ -260,6 +280,32 @@ if __name__ == "__main__":
     
     def list_of_floats(arg):
         return list(map(float, arg.split(',')))
+    
+    def parse_layer_range(arg, total_layers):
+        """Parse layer range specification like '0,1,2' or '0-5' or 'all'"""
+        if arg is None or arg.lower() == 'all':
+            return list(range(total_layers))
+        
+        layers = []
+        for part in arg.split(','):
+            part = part.strip()
+            if '-' in part:
+                # Handle range like '0-5'
+                start, end = map(int, part.split('-'))
+                layers.extend(range(start, end + 1))
+            else:
+                # Handle single layer like '0'
+                layers.append(int(part))
+        
+        # Remove duplicates and sort
+        layers = sorted(list(set(layers)))
+        
+        # Validate layer indices
+        for layer in layers:
+            if layer < 0 or layer >= total_layers:
+                raise ValueError(f"Layer {layer} is out of range [0, {total_layers-1}]")
+        
+        return layers
 
     parser = argparse.ArgumentParser()
 
@@ -380,6 +426,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--saving_path", type=str, help="the saving path of quantized model"
     )
+    parser.add_argument(
+        "--gptq_layers", 
+        type=str, 
+        default=None,
+        help="Specify which layers to run GPTQ calculation on. Format: '0,1,2' or '0-5' or 'all'. Default: all layers"
+    )
 
     args = parser.parse_args()
     print(f'Arguments: {args}')
@@ -420,6 +472,13 @@ if __name__ == "__main__":
     )
     device = "cuda:0"
     
+    # Parse GPTQ layers specification
+    gptq_layers = None
+    if args.gptq_layers is not None:
+        total_layers = len(model.model.layers)
+        gptq_layers = parse_layer_range(args.gptq_layers, total_layers)
+        print(f"GPTQ will be calculated on layers: {gptq_layers}")
+    
     # Check if both wbits and attn_bits are bf16 (no quantization needed)
     if args.wbits == "bf16" and args.attn_bits == "bf16":
         print("Both wbits and attn_bits are bf16, skipping quantization...")
@@ -429,7 +488,7 @@ if __name__ == "__main__":
         print("Skipped quantization - model kept on GPU for evaluation")
     else:
         tick = time.time()
-        quantizers = mixtral_sequential(model, dataloader, device, bit_config)
+        quantizers = mixtral_sequential(model, dataloader, device, bit_config, gptq_layers)
         print("quantization time:", time.time() - tick, "s")
     
     print(model)
