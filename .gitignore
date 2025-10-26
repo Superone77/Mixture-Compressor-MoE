@@ -1,0 +1,53 @@
+# AlphaQuant directory
+AlphaQuant/
+alphaquant/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info
+dist/
+build/
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files and checkpoints
+*.pt
+*.pth
+*.bin
+*.pkl
+
+# Data files
+*.csv
+data/
+
+# Results and outputs
+results/
+wandb/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+*.tmp
+

@@ -6,6 +6,10 @@ import logging
 import torch.nn as nn
 from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+import csv
+import re
+from pathlib import Path
+from typing import Optional, Tuple, Dict
 
 from gptq import GPTQ
 from modelutils import find_layers
@@ -49,6 +53,107 @@ expert_modules = [
 logger = logging.getLogger(__name__)
 
 
+@torch.no_grad()
+def alpha_hill_from_weight(
+    W: torch.Tensor,
+    k: Optional[int] = None,
+    k_frac: float = 0.1,
+    eps: float = 1e-12,
+) -> Tuple[float, int, int]:
+    """Compute PL_Alpha_Hill for a weight tensor W.
+    
+    Returns: alpha, k_used, n_eigs
+    """
+    # Ensure dense & 2D
+    if W.is_sparse:
+        W = W.to_dense()
+    if W.ndim > 2:
+        W = W.reshape(W.shape[0], -1)
+
+    m, n = W.shape
+    min_dim = min(m, n)
+    if min_dim < 2:
+        return float("nan"), 1, min_dim
+
+    # Compute SVD on CPU in float32 for stability
+    W_ = W.to(dtype=torch.float32, device="cpu")
+    s = torch.linalg.svdvals(W_)
+    lam = (s ** 2)
+    
+    lam, _ = torch.sort(lam)
+    n_eigs = lam.numel()
+    if n_eigs < 2:
+        return float("nan"), 1, n_eigs
+    
+    if k is None:
+        k_used = max(10, int(n_eigs * k_frac))
+    else:
+        k_used = k
+    k_used = max(1, min(k_used, n_eigs - 1))
+    
+    eps_t = torch.tensor(eps, dtype=lam.dtype, device=lam.device)
+    lam_ref = torch.clamp(lam[-k_used-1], min=eps_t)
+    top = lam[-k_used:]
+    denom = torch.log(top / lam_ref).sum().clamp_min(eps_t)
+    alpha = float(1.0 + (k_used / float(denom)))
+    return alpha, k_used, n_eigs
+
+
+def compute_alpha_values(model, cache_dir=None):
+    """Compute alpha values for all linear layers in MoE experts."""
+    cache_path = None
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, "alpha_values.csv")
+        if os.path.exists(cache_path):
+            logger.info(f"Loading alpha values from cache: {cache_path}")
+            return load_alpha_from_csv(cache_path)
+    
+    logger.info("Computing alpha values for all layers...")
+    results = {}
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            weight = module.weight.detach()
+            if weight is None:
+                continue
+                
+            try:
+                alpha, k_used, n_eigs = alpha_hill_from_weight(weight)
+                results[name] = alpha
+            except Exception as e:
+                logger.warning(f"Failed to compute alpha for {name}: {e}")
+                results[name] = float('nan')
+    
+    if cache_path:
+        logger.info(f"Saving alpha values to: {cache_path}")
+        save_alpha_to_csv(results, cache_path)
+    
+    return results
+
+
+def save_alpha_to_csv(alpha_results, filename):
+    """Save alpha results to CSV file."""
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['layer_name', 'alpha'])
+        for name, alpha in alpha_results.items():
+            writer.writerow([name, alpha])
+
+
+def load_alpha_from_csv(filename):
+    """Load alpha values from CSV file."""
+    alpha_results = {}
+    with open(filename, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                alpha_results[row['layer_name']] = float(row['alpha'])
+            except (ValueError, KeyError):
+                continue
+    return alpha_results
+
+
 def get_model():
     import torch
     def skip(*args, **kwargs):
@@ -75,6 +180,12 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
+    
+    # Compute alpha values if needed
+    alpha_values = None
+    if args.mixed_type == "mixed_with_alpha":
+        alpha_values = compute_alpha_values(model, cache_dir=args.cache_dir)
+        print(f"Computed alpha values for {len(alpha_values)} layers")
 
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
@@ -126,6 +237,11 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
         full = find_layers(layer)
 
         sequential = [list(full.keys())]
+        
+        # Initialize variables
+        low_bit_experts = []
+        high_bit_experts = []
+        
         # random generation
         if args.mixed_type == "random":
             import random
@@ -157,6 +273,47 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
              else:
                 print("Please generate the high_experts.pkl and low_experts.pkl first!")
                 exit()
+        elif args.mixed_type == "mixed_with_alpha":
+            # Compute alpha values for expert modules in this layer
+            expert_alpha_values = {}
+            layer_name_prefix = f'model.layers.{i}.block_sparse_moe.experts.'
+            
+            # Get alpha values for all experts in this layer
+            for expert_idx in range(8):
+                expert_prefix = f'{layer_name_prefix}{expert_idx}'
+                # Get alpha values for all three weight matrices (w1, w2, w3)
+                alpha_sum = 0.0
+                count = 0
+                for weight_name in ['w1', 'w2', 'w3']:
+                    weight_full_name = f'{expert_prefix}.{weight_name}'
+                    if weight_full_name in alpha_values:
+                        alpha_val = alpha_values[weight_full_name]
+                        # Check if alpha is valid (not NaN and not infinite)
+                        if isinstance(alpha_val, (int, float)) and alpha_val == alpha_val and abs(alpha_val) != float('inf'):
+                            alpha_sum += alpha_val
+                            count += 1
+                
+                if count > 0:
+                    expert_alpha_values[expert_idx] = alpha_sum / count
+                else:
+                    # If no valid alpha found, use a default value
+                    expert_alpha_values[expert_idx] = 0.0
+            
+            # Sort experts by alpha value (ascending: smaller alpha = more sensitive = higher precision)
+            sorted_experts = sorted(expert_alpha_values.items(), key=lambda x: x[1])
+            
+            # Calculate number of experts for each precision
+            total_experts = 8
+            n_high_bit = int(total_experts * args.high_bit_experts_ratio)
+            n_low_bit = int(total_experts * args.low_bit_experts_ratio)
+            
+            # Smaller alpha gets higher precision (wbits+1)
+            high_bit_experts = ["block_sparse_moe.experts."+str(sorted_experts[j][0]) for j in range(n_high_bit)]
+            # Larger alpha gets lower precision (wbits-1)
+            low_bit_experts = ["block_sparse_moe.experts."+str(sorted_experts[total_experts - j - 1][0]) for j in range(n_low_bit)]
+            
+            print(f"Layer {i}: High bit experts (alpha_sorted): {[expert_alpha_values[int(e.split('.')[-1])] for e in high_bit_experts]}")
+            print(f"Layer {i}: Low bit experts (alpha_sorted): {[expert_alpha_values[int(e.split('.')[-1])] for e in low_bit_experts]}")
         
 
 
@@ -340,7 +497,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mixed_type",
         type=str,
-        choices=["uniform", "mixed", "random", "manual"],
+        choices=["uniform", "mixed", "random", "manual", "mixed_with_alpha"],
         help='Whether to use mixed-precision',
     )
     parser.add_argument(
@@ -360,6 +517,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--saving_path", type=str, help="the saving path of quantized model"
+    )
+    parser.add_argument(
+        "--cache_dir", type=str, default=None, help="Directory to cache alpha values"
+    )
+    parser.add_argument(
+        "--high_bit_experts_ratio", type=float, default=0.25, help="Ratio of high bit experts (for mixed_with_alpha)"
+    )
+    parser.add_argument(
+        "--low_bit_experts_ratio", type=float, default=0.25, help="Ratio of low bit experts (for mixed_with_alpha)"
     )
 
     args = parser.parse_args()
@@ -398,7 +564,7 @@ if __name__ == "__main__":
     print(model)
 
     if args.eval_ppl:
-        for dataset in ["wikitext2", "c4", "ptb"]:
+        for dataset in ["wikitext2"]:#, "c4", "ptb"]:
             dataloader, testloader = get_loaders(
                 dataset, seed=args.seed, seqlen=2048, model=args.model
             )
