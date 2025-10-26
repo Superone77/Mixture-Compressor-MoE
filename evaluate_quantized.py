@@ -20,19 +20,11 @@ Example:
 """
 
 import os
-import sys
 import argparse
 import torch
 
-# Add AlphaQuant to path for eval_utils
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'AlphaQuant'))
-
 from transformers import AutoTokenizer
 from inference import load_quantized_model
-
-from eval_utils import tasks_evaluate
-
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -139,6 +131,7 @@ def main():
         # If tokenizer not found, try loading from the original model path
         print("Warning: Tokenizer not found in quantized model directory")
         print("Make sure tokenizer files are in the model path")
+        raise
     
     print("\n" + "="*80)
     print("Starting evaluation...")
@@ -147,13 +140,41 @@ def main():
     # Parse tasks
     task_list = [task.strip() for task in args.tasks.split(',')]
     
-    # Run evaluation
-    tasks_evaluate(
-        model=model,
-        tasks=task_list,
+    # Import HFLM wrapper from lm_eval
+    from lm_eval.models.huggingface import HFLM
+    from lm_eval import evaluator
+    
+    # Wrap model with HFLM for lm_eval
+    print(f"Wrapping model with HFLM...")
+    lm = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
         batch_size=args.batch_size,
         device=args.device
     )
+    
+    # Run evaluation for each task
+    print(f"Evaluating on tasks: {task_list}")
+    
+    for task in task_list:
+        print(f"\nEvaluating task: {task}")
+        print("-" * 80)
+        
+        result = evaluator.simple_evaluate(
+            model=lm,
+            tasks=[task],
+            batch_size=args.batch_size
+        )
+        
+        # Display results
+        if 'results' in result and task in result['results']:
+            task_results = result['results'][task]
+            print(f"\n{task} Results:")
+            for metric, value in task_results.items():
+                if isinstance(value, (int, float)):
+                    print(f"  {metric}: {value:.4f}")
+                else:
+                    print(f"  {metric}: {value}")
     
     print("\n" + "="*80)
     print("Evaluation complete!")
