@@ -239,9 +239,21 @@ def moe_sequential(model, dataloader, dev, bit_config=None):
         alpha_values = compute_alpha_values(model, cache_dir=args.cache_dir)
         print(f"Computed alpha values for {len(alpha_values)} layers")
 
+    # Move necessary components to device
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
     model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
+    
+    # Ensure rotary embeddings in the first layer are also moved to device
+    # This is important for models like OLMoE where rotary_emb might have CPU buffers
+    if hasattr(layers[0], 'self_attn') and hasattr(layers[0].self_attn, 'rotary_emb'):
+        rotary_emb = layers[0].self_attn.rotary_emb
+        rotary_emb = rotary_emb.to(dev)
+        # Explicitly move all buffers to device
+        for buffer in rotary_emb.buffers():
+            if buffer.device != dev:
+                buffer.data = buffer.data.to(dev)
+        layers[0].self_attn.rotary_emb = rotary_emb
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
@@ -286,6 +298,17 @@ def moe_sequential(model, dataloader, dev, bit_config=None):
         print('+================================+============+============+============+=========+')
 
         layer = layers[i].to(dev)
+        
+        # Ensure rotary embeddings are moved to device
+        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+            rotary_emb = layer.self_attn.rotary_emb
+            rotary_emb = rotary_emb.to(dev)
+            # Explicitly move all buffers to device
+            for buffer in rotary_emb.buffers():
+                if buffer.device != dev:
+                    buffer.data = buffer.data.to(dev)
+            layer.self_attn.rotary_emb = rotary_emb
+        
         full = find_layers(layer)
 
         sequential = [list(full.keys())]
