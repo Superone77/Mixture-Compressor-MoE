@@ -9,14 +9,22 @@ import matplotlib.pyplot as plt
 import pickle
 import numpy as np
 
-from transformers.models.mixtral.modeling_mixtral import (
-    MixtralForCausalLM,
-    MixtralSparseMoeBlock,
-    MixtralBLockSparseTop2MLP,
-    MixtralRMSNorm,
-    MISTRAL_ATTENTION_CLASSES)
-
-from transformers.models.mixtral.configuration_mixtral import MixtralConfig
+# Keep imports but make them optional for compatibility
+try:
+    from transformers.models.mixtral.modeling_mixtral import (
+        MixtralForCausalLM,
+        MixtralSparseMoeBlock,
+        MixtralBLockSparseTop2MLP,
+        MixtralRMSNorm,
+        MISTRAL_ATTENTION_CLASSES)
+    from transformers.models.mixtral.configuration_mixtral import MixtralConfig
+except ImportError:
+    MixtralForCausalLM = None
+    MixtralSparseMoeBlock = None
+    MixtralBLockSparseTop2MLP = None
+    MixtralRMSNorm = None
+    MISTRAL_ATTENTION_CLASSES = None
+    MixtralConfig = None
 
 from data.cachedata import CacheDataset
 from utils.normal_quantizer import normal_quantize
@@ -29,12 +37,16 @@ class PrunableMixtralSparseMoeBlockWrapper(torch.nn.Module):
                  r: Optional[int] = None,
                  ):
         super().__init__()
-        if isinstance(model, MixtralSparseMoeBlock):
+        # Support both direct MoE block or nested structure
+        if hasattr(model, 'gate') and hasattr(model, 'experts'):
             self.model = model
-        else:
+        elif hasattr(model, 'model') and hasattr(model.model, 'gate'):
             self.model = model.model
+        else:
+            self.model = model
+        
         self.r = r
-        self.num_experts = model.num_experts
+        self.num_experts = getattr(model, 'num_experts', getattr(self.model, 'num_experts', 8))
         self.experts_to_drop = None
         self.cache_space = CacheDataset()
         self.cache_logits = False
@@ -173,12 +185,16 @@ class QuantbleMixtralSparseMoeBlockWrapper(torch.nn.Module):
                  r: Optional[int] = None,
                  ):
         super().__init__()
-        if isinstance(model, MixtralSparseMoeBlock):
+        # Support both direct MoE block or nested structure
+        if hasattr(model, 'gate') and hasattr(model, 'experts'):
             self.model = model
-        else:
+        elif hasattr(model, 'model') and hasattr(model.model, 'gate'):
             self.model = model.model
+        else:
+            self.model = model
+        
         self.r = r
-        self.num_experts = model.num_experts
+        self.num_experts = getattr(model, 'num_experts', getattr(self.model, 'num_experts', 8))
         self.experts_to_drop = None
         self.cache_space = CacheDataset()
         self.cache_logits = False
@@ -306,12 +322,16 @@ class DynamicRankMixtralSparseMoeBlockWrapper(torch.nn.Module):
                  r: Optional[int] = None,
                  ):
         super().__init__()
-        if isinstance(model, MixtralSparseMoeBlock):
+        # Support both direct MoE block or nested structure
+        if hasattr(model, 'gate') and hasattr(model, 'experts'):
             self.model = model
-        else:
+        elif hasattr(model, 'model') and hasattr(model.model, 'gate'):
             self.model = model.model
+        else:
+            self.model = model
+        
         self.r = r
-        self.num_experts = self.model.num_experts
+        self.num_experts = getattr(self.model, 'num_experts', 8)
         self.experts_to_drop = None
         self.cache_space = CacheDataset()
         self.cache_logits = False

@@ -4,7 +4,6 @@ import time
 import torch
 import logging
 import torch.nn as nn
-from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import csv
 import re
@@ -51,6 +50,40 @@ expert_modules = [
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_moe_module_name(layer):
+    """Detect the MoE module name in a layer"""
+    if hasattr(layer, 'block_sparse_moe'):
+        return 'block_sparse_moe'
+    elif hasattr(layer, 'mlp'):
+        return 'mlp'
+    elif hasattr(layer, 'moe'):
+        return 'moe'
+    else:
+        raise ValueError(f"Could not find MoE module in layer. Available attributes: {dir(layer)}")
+
+
+def get_num_experts_from_moe_block(moe_block):
+    """Get the number of experts from an MoE block"""
+    if hasattr(moe_block, 'num_experts'):
+        return moe_block.num_experts
+    elif hasattr(moe_block, 'experts'):
+        return len(moe_block.experts)
+    else:
+        raise ValueError("Could not determine number of experts")
+
+
+def generate_expert_modules(num_experts=8):
+    """Generate expert module names for the given number of experts"""
+    expert_modules = []
+    for expert_idx in range(num_experts):
+        expert_modules.extend([
+            f"block_sparse_moe.experts.{expert_idx}.w1",
+            f"block_sparse_moe.experts.{expert_idx}.w3",
+            f"block_sparse_moe.experts.{expert_idx}.w2",
+        ])
+    return expert_modules
 
 
 @torch.no_grad()
@@ -167,19 +200,38 @@ def get_model():
     )
     model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
 
-    assert isinstance(
-        model, MixtralForCausalLM), 'Successfully loaded `Mixtral` model!'
+    # Check if model has MoE structure
+    has_moe = hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0
+    if has_moe:
+        first_layer = model.model.layers[0]
+        has_moe = hasattr(first_layer, 'block_sparse_moe') or hasattr(first_layer, 'mlp')
+    
+    if not has_moe:
+        raise ValueError('Model does not have a valid MoE structure!')
+    
     model.seqlen = 2048
     return model
 
 
 @torch.no_grad()
-def mixtral_sequential(model, dataloader, dev, bit_config=None):
+def moe_sequential(model, dataloader, dev, bit_config=None):
     print('Starting ...')
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
+    
+    # Detect MoE structure and number of experts
+    first_layer = layers[0]
+    moe_module_name = get_moe_module_name(first_layer)
+    moe_block = getattr(first_layer, moe_module_name)
+    num_experts = get_num_experts_from_moe_block(moe_block)
+    
+    print(f"Detected MoE structure: {moe_module_name} with {num_experts} experts")
+    
+    # Generate expert modules dynamically based on detected number
+    global expert_modules
+    expert_modules = generate_expert_modules(num_experts)
     
     # Compute alpha values if needed
     alpha_values = None
@@ -245,7 +297,7 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
         # random generation
         if args.mixed_type == "random":
             import random
-            numbers = list(range(8))
+            numbers = list(range(num_experts))
             low_bit_config = random.sample(numbers, 2)
             for num in low_bit_config:
                 numbers.remove(num)
@@ -279,7 +331,7 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
             layer_name_prefix = f'model.layers.{i}.block_sparse_moe.experts.'
             
             # Get alpha values for all experts in this layer
-            for expert_idx in range(8):
+            for expert_idx in range(num_experts):
                 expert_prefix = f'{layer_name_prefix}{expert_idx}'
                 # Get alpha values for all three weight matrices (w1, w2, w3)
                 alpha_sum = 0.0
@@ -303,7 +355,7 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
             sorted_experts = sorted(expert_alpha_values.items(), key=lambda x: x[1])
             
             # Calculate number of experts for each precision
-            total_experts = 8
+            total_experts = num_experts
             n_high_bit = int(total_experts * args.high_bit_experts_ratio)
             n_low_bit = int(total_experts * args.low_bit_experts_ratio)
             
@@ -559,7 +611,7 @@ if __name__ == "__main__":
     )
     device = "cuda:0"
     tick = time.time()
-    quantizers = mixtral_sequential(model, dataloader, device, bit_config)
+    quantizers = moe_sequential(model, dataloader, device, bit_config)
     print("quantization time:", time.time() - tick, "s")
     print(model)
 
@@ -574,8 +626,9 @@ if __name__ == "__main__":
             llama_eval(model, testloader, device, dataset)
             print("Time: ", time.time() - t1)
     if args.save:
-        average_bits = int(args.precisions[-9:-7])/8
-        saving_path = args.saving_path + f"Mixtral-8x7B-v0.1-atten_{args.attn_bits}-e_{average_bits}"
+        average_bits = int(args.precisions[-9:-7])/8 if args.precisions else 0
+        model_name = os.path.basename(args.model)
+        saving_path = args.saving_path + f"{model_name}-atten_{args.attn_bits}-e_{average_bits}"
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         tokenizer.save_pretrained(saving_path)
         from utils.pack import save_quantized

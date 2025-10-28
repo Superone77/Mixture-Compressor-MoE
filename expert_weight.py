@@ -6,15 +6,20 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from models.wrapper import PrunableMixtralSparseMoeBlockWrapper, QuantbleMixtralSparseMoeBlockWrapper, DynamicRankMixtralSparseMoeBlockWrapper, DynamicRankMixtralDecoderLayer
-from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM, MixtralDecoderLayer
 import numpy as np
 logger = logging.getLogger(__name__)
 
 
 
-def replace_with_dynamic_rank(model: MixtralForCausalLM, args: Namespace, block_range: int):
-    assert isinstance(
-        model, MixtralForCausalLM), 'Currently only `Mixtral` is supported'
+def replace_with_dynamic_rank(model, args: Namespace, block_range: int):
+    # Verify model has MoE structure
+    has_moe = hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0
+    if has_moe:
+        first_layer = model.model.layers[0]
+        has_moe = hasattr(first_layer, 'block_sparse_moe') or hasattr(first_layer, 'mlp')
+    
+    if not has_moe:
+        raise ValueError('Model does not have a valid MoE structure!')
     
     pruning_loss = [5045.205078, 403.264374, 6.949406, 6.804956, 6.935846, 6.583706, 6.535251, 6.573341, 6.408963, 6.365987, 6.392511, 6.327014, 6.400521, 6.286018, 6.266879, 6.37049, 6.458919, 6.517889, 6.565863, 6.774975, 6.509265, 6.424187, 6.296724, 6.345919, 6.279357, 6.302347, 6.286659, 6.303178, 6.326483, 6.598198, 6.890288, 9.767349]
     pruning_loss = np.array(pruning_loss)
@@ -40,9 +45,8 @@ def replace_with_dynamic_rank(model: MixtralForCausalLM, args: Namespace, block_
     return model
 
 
-def layerwise_experts_weights_frequencies(model: MixtralForCausalLM, calib_loader: DataLoader, args: Namespace):
-    assert isinstance(
-        model, MixtralForCausalLM), 'Currently only `Mixtral` is supported'
+def layerwise_experts_weights_frequencies(model, calib_loader: DataLoader, args: Namespace):
+    # Model structure will be validated by wrapper usage
 
     for l, layer in enumerate(model.model.layers):
         layer.block_sparse_moe = PrunableMixtralSparseMoeBlockWrapper(
@@ -88,9 +92,8 @@ def layerwise_experts_weights_frequencies(model: MixtralForCausalLM, calib_loade
 
     return model
 
-def layerwise_quant(model: MixtralForCausalLM, calib_loader: DataLoader, args: Namespace):
-    assert isinstance(
-        model, MixtralForCausalLM), 'Currently only `Mixtral` is supported'
+def layerwise_quant(model, calib_loader: DataLoader, args: Namespace):
+    # Model structure will be validated by wrapper usage
 
     for l, layer in enumerate(model.model.layers):
         layer.block_sparse_moe = QuantbleMixtralSparseMoeBlockWrapper(

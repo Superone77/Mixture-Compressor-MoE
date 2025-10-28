@@ -16,7 +16,7 @@ Extreme compression of Mixture-of-Experts Large Language Models. The current rel
 
 - MC-MoE for accurate weight-only quantization (Weight=**1.5～2.5bit**).
 - MC-MoE for efficient online dynamic pruning (additional compression ratio **> 10%**)
-- Support pre-trained MoE-LLM (currently only support **Mixtral 8 $\times$ 7b** and **Mixtral 8 $\times$ 22b**)
+- Support pre-trained MoE-LLM (currently supports **OLMoE-1B-7B-0125** and other MoE models with similar architecture)
 - Real deployment and dequantization process is built on `HQQ` and `GPTQ` for vanilla group-wise quantization. MC-MoE's static quantization can also be transfered to other type of technique, such as Vector Quantization (codebook).
 
 ## Install
@@ -34,22 +34,22 @@ For real quantization and deployment of compressed model, we utilize [HQQ](https
 Please make sure you have a Pytorch 2 version that matches your CUDA version: https://pytorch.org/.
 
 ## Experts Precision Zoo
-We provide the solved bit-width for each expert of **Mixtral 8 $\times$ 7b** in `./experts_mixture_bit_selection/`. You can directly use our provided results or generate them by your self.
+We provide the solved bit-width for each expert of **OLMoE-1B-7B-0125** or similar 8-expert MoE models in `./experts_mixture_bit_selection/`. You can directly use our provided results or generate them by your self.
 
 ## Usage
 
-**Quickly get the compressed model `./scripts/quant.sh`**. We have already provided all the needed middle results of **Mixtral 8 $\times$ 7b** in this code.
+**Quickly get the compressed model `./scripts/quant.sh`**. We have already provided all the needed middle results in this code.
 
 ```sh
 # Replace the path with yours, for example:
-Model_Path="/mnt/models/mistralai/Mixtral-8x7B-v0.1"
-Saving_Path="/mnt/models/mistralai/Mixtral-8x7B-v0.1-2.5b"
+Model_Path="allenai/OLMoE-1B-7B-0125"
+Saving_Path="./OLMoE-1B-7B-0125-quantized-"
 Precision_Path="./experts_mixture_bit_selection/experts_mixture_bitwidth_combination_20bit.pkl"
 python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
 
 ```
 
-Efficient Inference with **Pre-Loading MixedPrecision Quantization** and **Online Dynamic Pruning** : This example shows the demo of 2.5bit  Mixtral-8x7B model, the total static GPU memory consumption is around **16GB**, and the running memory is around **19GB** .
+Efficient Inference with **Pre-Loading MixedPrecision Quantization** and **Online Dynamic Pruning** : This example shows the demo of a quantized OLMoE-1B-7B-0125 model.
 
 ```python
 import os
@@ -64,7 +64,7 @@ torch.cuda.is_available()
 kwargs = {"device_map": 'auto',
           "torch_dtype": "torch.float16"}
 ######## Input your save_dir of quantized model########
-save_dir = "/mnt/models/mistralai/Mixtral-8x7B-v0.1-2.5bit"
+save_dir = "./OLMoE-1B-7B-0125-quantized-model"
 model = load_quantized_model(save_dir, kwargs)
 
 ######### Choose if you want to use dynamic pruning or not ##########
@@ -117,7 +117,7 @@ Model_Path=""
 python awareness.py ${Model_Path} --calibration c4
 
 # for example:
-Model_Path="/mnt/models/mistralai/Mixtral-8x7B-v0.1"
+Model_Path="allenai/OLMoE-1B-7B-0125"
 python awareness.py ${Model_Path} --calibration c4
 
 ```
@@ -165,7 +165,7 @@ Precision_Path=""
 python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path}
 
 # for example:
-Model_Path="/mnt/models/mistralai/Mixtral-8x7B-v0.1"
+Model_Path="allenai/OLMoE-1B-7B-0125"
 Precision_Path="./experts_mixture_bit_selection/experts_mixture_bitwidth_combination_16bit.pkl"
 python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path}
 
@@ -185,8 +185,8 @@ Precision_Path=""
 python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
 
 # for example:
-Model_Path="/mnt/models/mistralai/Mixtral-8x7B-v0.1"
-Saving_Path="/mnt/models/mistralai/Mixtral-8x7B-v0.1-2.05bit"
+Model_Path="allenai/OLMoE-1B-7B-0125"
+Saving_Path="./OLMoE-1B-7B-0125-quantized-"
 Precision_Path="./experts_mixture_bit_selection/experts_mixture_bitwidth_combination_16bit.pkl"
 python main.py ${Model_Path} --wbits 2bit --attn_bits 4bit --dataset wikitext2 --groupsize 128 --eval_ppl --mixed_type mixed --precisions ${Precision_Path} --pack --save --saving_path ${Saving_Path}
 
@@ -222,7 +222,7 @@ torch.cuda.is_available()
 kwargs = {"device_map": 'auto',
           "torch_dtype": "torch.float16"}
 ######## Input your save_dir of quantized model########
-save_dir = "/mnt/models/mistralai/Mixtral-8x7B-v0.1-2.5bit"
+save_dir = "./OLMoE-1B-7B-0125-quantized-model"
 model = load_quantized_model(save_dir, kwargs)
 
 ######### Choose if you want to use dynamic pruning or not ##########

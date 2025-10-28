@@ -1,6 +1,5 @@
 
 import logging
-from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 from gptq import GPTQ
@@ -20,8 +19,15 @@ def get_model():
 
     model = AutoModelForCausalLM.from_pretrained(args.model, device_map='auto',torch_dtype=torch.float16, attn_implementation="flash_attention_2" if args.use_flash_attention_2 else None)
 
-    assert isinstance(
-        model, MixtralForCausalLM), 'Successfully loaded `Mixtral` model!'
+    # Check if model has MoE structure
+    has_moe = hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0
+    if has_moe:
+        first_layer = model.model.layers[0]
+        has_moe = hasattr(first_layer, 'block_sparse_moe') or hasattr(first_layer, 'mlp')
+    
+    if not has_moe:
+        raise ValueError('Model does not have a valid MoE structure!')
+    
     model.seqlen = 2048
     return model
 
