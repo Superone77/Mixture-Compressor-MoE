@@ -3,6 +3,66 @@ import torch
 import torch.nn as nn
 
 @torch.no_grad()
+def mxfp4_quantize(x):
+    """
+    MXFP4 quantization with block-wise scaling.
+    This implements the fp4 (1-2-1) format used in MXFP4.
+    """
+    fp4_max = 6.0
+    sign_val = torch.sign(x)
+    x_abs = torch.abs(x)
+    
+    # Reshape to process block by block (block_size = 32 for MXFP4)
+    original_shape = x_abs.shape
+    if len(original_shape) == 1:
+        x_abs = x_abs.view(-1, 32)
+    elif len(original_shape) == 2:
+        # Flatten and reshape to blocks of 32
+        x_flat = x_abs.flatten()
+        pad_size = (32 - len(x_flat) % 32) % 32
+        if pad_size > 0:
+            x_abs = torch.cat([x_flat, torch.zeros(pad_size, device=x_flat.device, dtype=x_flat.dtype)])
+        x_abs = x_abs.view(-1, 32)
+    else:
+        # For higher dimensions, flatten first
+        x_abs = x_abs.flatten()
+        pad_size = (32 - len(x_abs) % 32) % 32
+        if pad_size > 0:
+            x_abs = torch.cat([x_abs, torch.zeros(pad_size, device=x_abs.device, dtype=x_abs.dtype)])
+        x_abs = x_abs.view(-1, 32)
+    
+    # Compute per-block scale
+    scale_b = torch.clamp(fp4_max / torch.clamp(torch.max(x_abs, dim=1, keepdim=True)[0], min=1e-12), min=0.0, max=100.0)
+    
+    # Scale the values
+    y = x_abs * scale_b
+    
+    # Quantize to fp4 (1-2-1) levels
+    # Levels: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+    q_abs = torch.zeros_like(y)
+    q_abs = torch.where(y > 5, 6.0, q_abs)
+    q_abs = torch.where((y > 3.5) & (y <= 5), 4.0, q_abs)
+    q_abs = torch.where((y > 2.5) & (y <= 3.5), 3.0, q_abs)
+    q_abs = torch.where((y > 1.75) & (y <= 2.5), 2.0, q_abs)
+    q_abs = torch.where((y > 1.25) & (y <= 1.75), 1.5, q_abs)
+    q_abs = torch.where((y > 0.75) & (y <= 1.25), 1.0, q_abs)
+    q_abs = torch.where((y > 0.25) & (y <= 0.75), 0.5, q_abs)
+    q_abs = torch.where(y <= 0.25, 0.0, q_abs)
+    
+    # Unscale
+    result = sign_val * q_abs / scale_b
+    
+    # Reshape back
+    if len(original_shape) == 1:
+        return result.view(original_shape)
+    elif len(original_shape) >= 2:
+        result = result.flatten()
+        result = result[:original_shape.numel()]
+        return result.view(original_shape)
+    return result
+
+
+@torch.no_grad()
 def normal_quantize(x, scale, zero, maxq):
     return torch.clamp(torch.round(x / scale + zero), 0, maxq)
 
@@ -87,6 +147,20 @@ class Quantizer(nn.Module):
 
     def configure(self, bits, perchannel=False, sym=True, mse=False, norm=2.4, grid=100, maxshrink=.8, trits=False, pack=False):
 
+        # Handle special quantization types like mxfp4
+        if isinstance(bits, str) and bits == "mxfp4":
+            self.method = "mxfp4"
+            self.maxq = torch.tensor(0, dtype=torch.float16)
+            self.perchannel = perchannel
+            self.sym = sym
+            self.mse = mse
+            self.norm = norm
+            self.grid = grid
+            self.maxshrink = maxshrink
+            self.scale = torch.zeros_like(self.scale, dtype=torch.float16)
+            self.pack = pack
+            return
+        
         self.maxq = torch.tensor(2**bits - 1)
         self.perchannel = perchannel
         self.sym = sym
@@ -98,6 +172,7 @@ class Quantizer(nn.Module):
             self.maxq = torch.tensor(-1)
         self.scale = torch.zeros_like(self.scale, dtype=torch.float16)
         self.pack = pack
+        self.method = "normal"
 
     def _quantize(self, x, scale, zero, maxq):
         if maxq < 0:
@@ -114,6 +189,10 @@ class Quantizer(nn.Module):
         return scale * (q - zero) if not self.pack else q
 
     def find_params(self, w, weight=False):
+        # Handle mxfp4 case - no need for scale/zero computation
+        if hasattr(self, 'method') and self.method == "mxfp4":
+            return
+        
         perchannel = True
         weight = True
         dev = w.device
@@ -220,6 +299,10 @@ class Quantizer(nn.Module):
         self.maxq = maxq
 
     def quantize(self, x):
+        # Handle mxfp4 quantization
+        if hasattr(self, 'method') and self.method == "mxfp4":
+            return mxfp4_quantize(x)
+        
         if self.ready():
             if self.pack:
                 return self._quantize(x, self.scale, self.zero, self.maxq), self.scale, self.zero
@@ -227,9 +310,13 @@ class Quantizer(nn.Module):
         return x
 
     def enabled(self):
+        if hasattr(self, 'method') and self.method == "mxfp4":
+            return True
         return self.maxq > 0
 
     def ready(self):
+        if hasattr(self, 'method') and self.method == "mxfp4":
+            return True
         return torch.all(self.scale != 0)
 
 

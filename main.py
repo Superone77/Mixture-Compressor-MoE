@@ -384,10 +384,14 @@ def moe_sequential(model, dataloader, dev, bit_config=None):
                         gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                         gptq[name].wbits = args.attn_bits
                     else:
-                        if name[:-3] in high_bit_experts:
+                        # Handle mxfp4 special case
+                        if isinstance(args.wbits, str) and args.wbits == "mxfp4":
+                            gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = args.wbits
+                        elif name[:-3] in high_bit_experts and not isinstance(args.wbits, str):
                             gptq[name].quantizer.configure(args.wbits+1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                             gptq[name].wbits = args.wbits+1
-                        elif name[:-3] in low_bit_experts:
+                        elif name[:-3] in low_bit_experts and not isinstance(args.wbits, str):
                             gptq[name].quantizer.configure(args.wbits-1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                             gptq[name].wbits = args.wbits-1
                         else:
@@ -459,13 +463,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wbits",
         type=str,
-        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit"],
+        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit", "mxfp4"],
         help="weight bit-width",
     )
     parser.add_argument(
         "--attn_bits",
         type=str,
-        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit"],
+        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit", "mxfp4"],
         help="attention weight bit-width",
     )
     parser.add_argument(
@@ -584,8 +588,16 @@ if __name__ == "__main__":
     print(f'Arguments: {args}')
 
     groupsize = args.groupsize
-    args.wbits = int(args.wbits[0])
-    args.attn_bits = int(args.attn_bits[0])
+    # Handle mxfp4 as special case
+    if args.wbits == "mxfp4":
+        args.wbits = "mxfp4"
+    else:
+        args.wbits = int(args.wbits[0])
+    
+    if args.attn_bits == "mxfp4":
+        args.attn_bits = "mxfp4"
+    else:
+        args.attn_bits = int(args.attn_bits[0])
 
     model = get_model()
     model.eval()
