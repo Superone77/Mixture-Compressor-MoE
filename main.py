@@ -419,7 +419,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["wikitext2", "ptb", "c4", "mix"],
+        choices=["wikitext2", "ptb", "c4", "gsm8k", "mix"],
         help="Where to extract calibration data from.",
     )
     parser.add_argument("--load_quantized", action="store_true")

@@ -88,6 +88,47 @@ def get_c4(nsamples, seed, seqlen, model, tokenizer):
 
     return trainloader, valenc
 
+def get_gsm8k(nsamples, seed, seqlen, model, tokenizer):
+    """Load GSM8K dataset from HuggingFace and prepare calibration data from training set."""
+    traindata = load_dataset('gsm8k', 'main', split='train')
+    testdata = load_dataset('gsm8k', 'main', split='test')
+    
+    random.seed(seed)
+    trainloader = []
+    
+    # Combine question and answer for training data
+    for _ in range(nsamples):
+        while True:
+            i = random.randint(0, len(traindata) - 1)
+            # Combine question and answer into a single text
+            question = traindata[i]['question']
+            answer = traindata[i]['answer']
+            text = f"{question}\n\n{answer}"
+            
+            trainenc = tokenizer(text, return_tensors='pt')
+            if trainenc.input_ids.shape[1] > seqlen:
+                break
+        
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+    
+    # Prepare test data (combine question and answer)
+    test_texts = []
+    for item in testdata[:1100]:
+        question = item['question']
+        answer = item['answer']
+        test_texts.append(f"{question}\n\n{answer}")
+    
+    testenc = tokenizer('\n\n'.join(test_texts), return_tensors='pt')
+    testenc = testenc.input_ids[:, :(256 * seqlen)]
+    testenc = TokenizerWrapper(testenc)
+    
+    return trainloader, testenc
+
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
     model_name = model.split('/')[-1]
     cache_file=f'/mnt/afs/yliao/Tasks/moe/Expert_Quant/moeq/cache/{name}_{nsamples}_{seed}_{seqlen}/Mixtral-8x7B-v0.1.pt'
@@ -105,6 +146,8 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
         loaders= get_ptb(nsamples, seed, seqlen, model, tokenizer)
     if 'c4' in name:
         loaders= get_c4(nsamples, seed, seqlen, model, tokenizer)
+    if 'gsm8k' in name:
+        loaders= get_gsm8k(nsamples, seed, seqlen, model, tokenizer)
     if 'mix' in name:
         wiki_train,wiki_val=get_wikitext2(nsamples//3, seed, seqlen, model, tokenizer)
         ptb_train,ptb_val=get_ptb(nsamples//3, seed, seqlen, model, tokenizer)
