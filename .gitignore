@@ -1,7 +1,6 @@
 # AlphaQuant directory
 AlphaQuant/
 alphaquant/
-local_scripts/
 
 # Python
 __pycache__/
