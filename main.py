@@ -4,7 +4,9 @@ import time
 import torch
 import logging
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer
+from olmoe.configuration_olmoe import OlmoeConfig
+from olmoe.modeling_olmoe import OlmoeForCausalLM
 import csv
 import re
 from pathlib import Path
@@ -195,10 +197,10 @@ def get_model():
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
 
-    config = AutoConfig.from_pretrained(
+    config = OlmoeConfig.from_pretrained(
         args.model, attn_implementation=args.attn_implementation
     )
-    model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
+    model = OlmoeForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
 
     # Check if model has MoE structure
     has_moe = hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0
