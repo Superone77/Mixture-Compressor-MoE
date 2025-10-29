@@ -13,7 +13,15 @@
 
 from typing import Optional
 
-from transformers.configuration_utils import PreTrainedConfig
+# Try multiple import paths for PreTrainedConfig to support different transformers versions
+try:
+    from transformers import PreTrainedConfig
+except ImportError:
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+    except ImportError:
+        raise ImportError("Cannot import PreTrainedConfig from transformers. Please check your transformers version.")
+
 try:
     from transformers.modeling_rope_utils import RopeParameters, rope_config_validation, standardize_rope_params
 except ImportError:
@@ -168,9 +176,10 @@ class OlmoeConfig(PreTrainedConfig):
         self.rope_parameters = rope_scaling or rope_parameters
 
         # Validate the correctness of rotary position embeddings parameters
-        rope_theta = kwargs.get("rope_theta", 10000.0)
-        standardize_rope_params(self, rope_theta=rope_theta)
-        rope_config_validation(self)
+        if standardize_rope_params is not None and rope_config_validation is not None:
+            rope_theta = kwargs.get("rope_theta", 10000.0)
+            standardize_rope_params(self, rope_theta=rope_theta)
+            rope_config_validation(self)
 
         super().__init__(
             pad_token_id=pad_token_id,
