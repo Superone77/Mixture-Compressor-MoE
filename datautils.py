@@ -89,44 +89,74 @@ def get_c4(nsamples, seed, seqlen, model, tokenizer):
     return trainloader, valenc
 
 def get_gsm8k(nsamples, seed, seqlen, model, tokenizer):
-    """Load GSM8K dataset from HuggingFace and prepare calibration data from training set."""
+    """Load GSM8K and prepare calibration data efficiently by batch tokenization."""
     traindata = load_dataset('gsm8k', 'main', split='train')
     testdata = load_dataset('gsm8k', 'main', split='test')
-    
+
     random.seed(seed)
-    trainloader = []
-    
-    # Combine question and answer for training data
-    for _ in range(nsamples):
-        while True:
-            i = random.randint(0, len(traindata) - 1)
-            # Combine question and answer into a single text
-            question = traindata[i]['question']
-            answer = traindata[i]['answer']
-            text = f"{question}\n\n{answer}"
-            
-            trainenc = tokenizer(text, return_tensors='pt')
-            if trainenc.input_ids.shape[1] > seqlen:
+
+    # Build texts once
+    train_texts = [f"{q}\n\n{a}" for q, a in zip(traindata['question'], traindata['answer'])]
+
+    # Batch tokenize to get lengths quickly (no tensors to save memory)
+    train_encodings = tokenizer(
+        train_texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+    )
+    input_ids_list = train_encodings["input_ids"]
+
+    # Pre-filter indices that are long enough
+    eligible_indices = [idx for idx, ids in enumerate(input_ids_list) if len(ids) > seqlen]
+    if not eligible_indices:
+        # Fallback: if nothing is long enough, concatenate multiple samples to exceed seqlen
+        # This path should be rare for GSM8K
+        concat_ids = []
+        for ids in input_ids_list:
+            concat_ids.extend(ids)
+            if len(concat_ids) > seqlen:
                 break
-        
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
+        concat_tensor = torch.tensor(concat_ids, dtype=torch.long).unsqueeze(0)
+        start = 0
+        end = seqlen
+        inp = concat_tensor[:, start:end]
         tar = inp.clone()
         tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    
-    # Prepare test data (combine question and answer)
-    test_texts = []
-    for item in testdata[:1100]:
-        question = item['question']
-        answer = item['answer']
-        test_texts.append(f"{question}\n\n{answer}")
-    
-    testenc = tokenizer('\n\n'.join(test_texts), return_tensors='pt')
-    testenc = testenc.input_ids[:, :(256 * seqlen)]
-    testenc = TokenizerWrapper(testenc)
-    
+        trainloader = [(inp, tar)] * nsamples
+    else:
+        # Sample without repeated tokenization
+        trainloader = []
+        for _ in range(nsamples):
+            idx = random.choice(eligible_indices)
+            ids = input_ids_list[idx]
+            max_start = len(ids) - seqlen - 1
+            s = random.randint(0, max(0, max_start))
+            e = s + seqlen
+            window = torch.tensor(ids[s:e], dtype=torch.long).unsqueeze(0)
+            inp = window
+            tar = inp.clone()
+            tar[:, :-1] = -100
+            trainloader.append((inp, tar))
+
+    # Prepare test data efficiently: batch tokenize then flatten
+    test_texts = [f"{q}\n\n{a}" for q, a in zip(testdata['question'][:1100], testdata['answer'][:1100])]
+    test_enc = tokenizer(
+        test_texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+    )
+    flat_ids = []
+    for ids in test_enc["input_ids"]:
+        flat_ids.extend(ids)
+        if len(flat_ids) >= 256 * seqlen:
+            break
+    flat_tensor = torch.tensor(flat_ids[: 256 * seqlen], dtype=torch.long).unsqueeze(0)
+    testenc = TokenizerWrapper(flat_tensor)
+
     return trainloader, testenc
 
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
