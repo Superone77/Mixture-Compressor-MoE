@@ -89,14 +89,22 @@ def get_c4(nsamples, seed, seqlen, model, tokenizer):
     return trainloader, valenc
 
 def get_gsm8k(nsamples, seed, seqlen, model, tokenizer):
-    """Load GSM8K and prepare calibration data efficiently by batch tokenization."""
+    """Load GSM8K and prepare calibration data efficiently using only question or answer.
+
+    Controlled by env var GSM8K_FIELD in {"question", "answer"}; default "question".
+    """
     traindata = load_dataset('gsm8k', 'main', split='train')
     testdata = load_dataset('gsm8k', 'main', split='test')
 
     random.seed(seed)
 
-    # Build texts once
-    train_texts = [f"{q}\n\n{a}" for q, a in zip(traindata['question'], traindata['answer'])]
+    # Choose field based on env "macro"
+    gsm8k_field = os.getenv('GSM8K_FIELD', 'question')
+    if gsm8k_field not in ("question", "answer"):
+        gsm8k_field = "question"
+
+    # Build texts once from the selected field only
+    train_texts = traindata[gsm8k_field]
 
     # Batch tokenize to get lengths quickly (no tensors to save memory)
     train_encodings = tokenizer(
@@ -141,7 +149,7 @@ def get_gsm8k(nsamples, seed, seqlen, model, tokenizer):
             trainloader.append((inp, tar))
 
     # Prepare test data efficiently: batch tokenize then flatten
-    test_texts = [f"{q}\n\n{a}" for q, a in zip(testdata['question'][:1100], testdata['answer'][:1100])]
+    test_texts = testdata[gsm8k_field][:1100]
     test_enc = tokenizer(
         test_texts,
         add_special_tokens=False,

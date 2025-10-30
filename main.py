@@ -422,6 +422,13 @@ if __name__ == "__main__":
         choices=["wikitext2", "ptb", "c4", "gsm8k", "mix"],
         help="Where to extract calibration data from.",
     )
+    parser.add_argument(
+        "--gsm8k_field",
+        type=str,
+        choices=["question", "answer"],
+        default="question",
+        help="For gsm8k, choose whether to use only the question or only the answer as calibration text.",
+    )
     parser.add_argument("--load_quantized", action="store_true")
     parser.add_argument(
         "--seed", type=int, default=0, help="Seed for sampling the calibration data."
@@ -530,6 +537,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     print(f'Arguments: {args}')
+
+    # Propagate gsm8k field selection via environment for datautils
+    if args.dataset == "gsm8k":
+        os.environ["GSM8K_FIELD"] = args.gsm8k_field
 
     groupsize = args.groupsize
     args.wbits = int(args.wbits[0])
