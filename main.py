@@ -612,8 +612,28 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 gptq[name] = GPTQ(subset[name], logger, name, args.wbits)
 
                 if args.mixed_type == "uniform":
-                    gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
-                    gptq[name].wbits = args.wbits
+                    # Configure quantization based on layer split option
+                    if args.half_layers_expert_split:
+                        # Split layers in half: first half uses wbits+1, second half uses wbits for experts
+                        total_layers = len(layers)
+                        if name not in expert_modules:
+                            # Attention layers: keep original attn_bits
+                            assigned_bit = args.attn_bits
+                        else:
+                            # Expert layers: first half uses wbits+1, second half uses wbits
+                            if i < total_layers // 2:
+                                assigned_bit = args.wbits + 1  # First half layers
+                            else:
+                                assigned_bit = args.wbits  # Second half layers
+                    else:
+                        # Default: use wbits for experts, attn_bits for attention
+                        if name not in expert_modules:
+                            assigned_bit = args.attn_bits
+                        else:
+                            assigned_bit = args.wbits
+                    
+                    gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
+                    gptq[name].wbits = assigned_bit
                     
                     # Track bit assignment for CSV export
                     if name in expert_modules:
@@ -623,7 +643,7 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                             expert_id = int(name_parts[-2])
                             # Only track once per expert (w1, w2, w3 all have same bit, so we track once)
                             if name.endswith('.w1'):
-                                bit_assignments.append((i, expert_id, args.wbits))
+                                bit_assignments.append((i, expert_id, assigned_bit))
                 elif args.mixed_type == "no_calib_auto_programming":
                     # Use global MILP-assigned bit-widths
                     # Construct full layer name: model.layers.{i}.{name}
@@ -905,6 +925,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_bit_assignments", type=str, default=None,
         help="Path to save layer-expert bit assignments (CSV format)"
+    )
+    parser.add_argument(
+        "--half_layers_expert_split", action="store_true",
+        help="If enabled, split layers in half: first half uses wbits+1 for experts, second half uses wbits. Attention layers keep original attn_bits."
     )
 
     args = parser.parse_args()
