@@ -463,6 +463,9 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
     print('Ready.')
     quantizers = {}
     
+    # Track bit assignments per layer and expert for CSV export
+    bit_assignments = []  # List of (layer_idx, expert_id, bit) tuples
+    
     # Global bit-width assignment for no_calib_auto_programming mode
     global_bit_assignments = {}
     if args.mixed_type == "no_calib_auto_programming":
@@ -611,6 +614,16 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 if args.mixed_type == "uniform":
                     gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
                     gptq[name].wbits = args.wbits
+                    
+                    # Track bit assignment for CSV export
+                    if name in expert_modules:
+                        # Extract expert_id from name (e.g., "block_sparse_moe.experts.0.w1" -> expert_id=0)
+                        name_parts = name.split('.')
+                        if len(name_parts) >= 3 and name_parts[-2].isdigit():
+                            expert_id = int(name_parts[-2])
+                            # Only track once per expert (w1, w2, w3 all have same bit, so we track once)
+                            if name.endswith('.w1'):
+                                bit_assignments.append((i, expert_id, args.wbits))
                 elif args.mixed_type == "no_calib_auto_programming":
                     # Use global MILP-assigned bit-widths
                     # Construct full layer name: model.layers.{i}.{name}
@@ -620,20 +633,42 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                     assigned_bit = global_bit_assignments.get(full_layer_name, args.wbits)
                     gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                     gptq[name].wbits = assigned_bit
+                    
+                    # Track bit assignment for CSV export
+                    if name in expert_modules:
+                        # Extract expert_id from name (e.g., "block_sparse_moe.experts.0.w1" -> expert_id=0)
+                        name_parts = name.split('.')
+                        if len(name_parts) >= 3 and name_parts[-2].isdigit():
+                            expert_id = int(name_parts[-2])
+                            # Track all weight matrices (w1, w2, w3) as they may have different bits in MILP mode
+                            bit_assignments.append((i, expert_id, assigned_bit))
                 else:
                     if name not in expert_modules:
                         gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                         gptq[name].wbits = args.attn_bits
                     else:
+                        assigned_bit = args.wbits
                         if name[:-3] in high_bit_experts:
-                            gptq[name].quantizer.configure(args.wbits+1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits+1
+                            assigned_bit = args.wbits+1
+                            gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = assigned_bit
                         elif name[:-3] in low_bit_experts:
-                            gptq[name].quantizer.configure(args.wbits-1, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits-1
+                            assigned_bit = args.wbits-1
+                            gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = assigned_bit
                         else:
-                            gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits
+                            gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = assigned_bit
+                        
+                        # Track bit assignment for CSV export
+                        # Extract expert_id from name (e.g., "block_sparse_moe.experts.0.w1" -> expert_id=0)
+                        name_parts = name.split('.')
+                        if len(name_parts) >= 3 and name_parts[-2].isdigit():
+                            expert_id = int(name_parts[-2])
+                            # Only track once per expert (w1, w2, w3 all have same bit, so we track once)
+                            # We'll use w1 as the representative (or track average)
+                            if name.endswith('.w1'):
+                                bit_assignments.append((i, expert_id, assigned_bit))
             # print(layer)
             def add_batch(name):
                 def tmp(_, inp, out):
@@ -679,6 +714,34 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
         print('\n')
 
     model.config.use_cache = use_cache
+    
+    # Save bit assignments to CSV if specified
+    if args.save_bit_assignments and bit_assignments:
+        # Group by layer and expert (take average if multiple entries per expert)
+        from collections import defaultdict
+        layer_expert_bits = defaultdict(lambda: defaultdict(list))
+        
+        for layer_idx, expert_id, bit_value in bit_assignments:
+            layer_expert_bits[layer_idx][expert_id].append(bit_value)
+        
+        # Calculate average bit for each layer-expert pair
+        csv_data = []
+        for layer_idx in sorted(layer_expert_bits.keys()):
+            for expert_id in sorted(layer_expert_bits[layer_idx].keys()):
+                bits = layer_expert_bits[layer_idx][expert_id]
+                avg_bit = sum(bits) / len(bits)
+                csv_data.append({
+                    'layer': layer_idx,
+                    'expert_id': expert_id,
+                    'bit': round(avg_bit, 2)
+                })
+        
+        # Save to CSV
+        df = pd.DataFrame(csv_data)
+        csv_path = args.save_bit_assignments
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Saved bit assignments to CSV: {csv_path}")
+        print(f"Saved bit assignments for {len(csv_data)} layer-expert pairs to {csv_path}")
 
     return quantizers
 
@@ -841,7 +904,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--save_bit_assignments", type=str, default=None,
-        help="Path to save layer-expert bit assignments (pickle format)"
+        help="Path to save layer-expert bit assignments (CSV format)"
     )
 
     args = parser.parse_args()
