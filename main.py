@@ -293,34 +293,34 @@ def load_alpha_from_csv(filename: str) -> Dict[str, float]:
                 continue
     return alpha_results
 
-def build_and_solve_milp_for_layer(
-    expert_alphas: Dict[int, float],
+def build_and_solve_global_milp(
+    layer_alpha_map: Dict[str, float],
     candidate_bits: list,
     bpp_budget: float,
     gamma: float = 1.0,
-) -> Dict[int, int]:
+) -> Dict[str, int]:
     """
-    为核心层专家计算MILP最优位宽分配。
+    为全局所有线性层计算MILP最优位宽分配。
     
     参数:
-        expert_alphas: {expert_idx: alpha_value} 每专家的alpha值
+        layer_alpha_map: {layer_name: alpha_value} 每个线性层的alpha值
         candidate_bits: 候选位宽列表 [2,3,4,8]
         bpp_budget: 平均位宽预算
         gamma: 形状先验指数，默认1.0
     
     返回:
-        assignment: {expert_idx: chosen_bit} 每专家分配到的位宽
+        assignment: {layer_name: chosen_bit} 每个线性层分配到的位宽
     """
     if pulp is None:
         raise ImportError("PuLP is required for MILP optimization. Install with: pip install pulp")
     
-    E = len(expert_alphas)
+    E = len(layer_alpha_map)
     if E == 0:
         return {}
     
-    # 将expert_alphas转换为列表，保证顺序
-    expert_indices = sorted(expert_alphas.keys())
-    alphas = [expert_alphas[idx] for idx in expert_indices]
+    # 将layer_alpha_map转换为列表，保证顺序
+    layer_names = sorted(layer_alpha_map.keys())
+    alphas = [layer_alpha_map[name] for name in layer_names]
     
     # 候选位宽检查
     candidate_bits = [int(b) for b in candidate_bits]
@@ -339,20 +339,20 @@ def build_and_solve_milp_for_layer(
     q_b_scalar = {b: 2.0 ** (-2 * b) for b in candidate_bits}
     
     # 建立 MILP 模型
-    prob = pulp.LpProblem("NoCalib_LayerExperts", pulp.LpMinimize)
+    prob = pulp.LpProblem("NoCalib_GlobalLayers", pulp.LpMinimize)
     
-    # 二元决策变量 x_{e,b}
+    # 二元决策变量 x_{l,b}
     x = {}
     for i in range(E):
         for b in candidate_bits:
             x[(i, b)] = pulp.LpVariable(f"x_{i}_{b}", lowBound=0, upBound=1, cat=pulp.LpBinary)
     
-    # 目标函数：sum_e sum_b x_{e,b} * s_e * q_{e,b}
+    # 目标函数：sum_l sum_b x_{l,b} * s_l * q_{l,b}
     obj_terms = []
     for i in range(E):
-        s_e = sensitivities[i]
+        s_l = sensitivities[i]
         for b in candidate_bits:
-            obj_terms.append(x[(i, b)] * (s_e * q_b_scalar[b]))
+            obj_terms.append(x[(i, b)] * (s_l * q_b_scalar[b]))
     prob += pulp.lpSum(obj_terms), "Total_Cost"
     
     # 约束1：每层恰好选择一个位宽
@@ -376,15 +376,15 @@ def build_and_solve_milp_for_layer(
     
     # 解析结果
     assignment = {}
-    for i, expert_idx in enumerate(expert_indices):
+    for i, layer_name in enumerate(layer_names):
         chosen_b = None
         for b in candidate_bits:
             if pulp.value(x[(i, b)]) >= 0.5:
                 chosen_b = b
                 break
         if chosen_b is None:
-            raise RuntimeError(f"Expert {expert_idx} 未选定位宽。")
-        assignment[expert_idx] = chosen_b
+            raise RuntimeError(f"Layer {layer_name} 未选定位宽。")
+        assignment[layer_name] = chosen_b
     
     return assignment
 
@@ -462,9 +462,52 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
     position_ids = cache['position_ids']
     print('Ready.')
     quantizers = {}
-    # Dictionary to store bit assignments for each layer and expert
-    # Format: {layer_idx: {expert_idx: bit_value}}
-    layer_expert_bits = {}
+    
+    # Global bit-width assignment for no_calib_auto_programming mode
+    global_bit_assignments = {}
+    if args.mixed_type == "no_calib_auto_programming":
+        try:
+            # Parse candidate bits
+            candidate_bits = [int(s.strip()) for s in args.milp_candidate_bits.split(",") if s.strip()]
+            if not candidate_bits:
+                raise ValueError("Empty candidate bits list")
+            
+            # Filter valid alpha values (exclude NaN and inf)
+            valid_alpha_map = {}
+            for layer_name, alpha_val in alpha_values.items():
+                if isinstance(alpha_val, (int, float)) and alpha_val == alpha_val and abs(alpha_val) != float('inf'):
+                    valid_alpha_map[layer_name] = alpha_val
+            
+            if not valid_alpha_map:
+                raise ValueError("No valid alpha values found")
+            
+            print(f"\n{'='*80}")
+            print(f"Running global MILP optimization for {len(valid_alpha_map)} layers...")
+            print(f"Candidate bits: {candidate_bits}")
+            print(f"BPP budget: {args.milp_bpp_budget}")
+            print(f"Gamma: {args.milp_gamma}")
+            print(f"{'='*80}\n")
+            
+            # Solve global MILP
+            global_bit_assignments = build_and_solve_global_milp(
+                layer_alpha_map=valid_alpha_map,
+                candidate_bits=candidate_bits,
+                bpp_budget=args.milp_bpp_budget,
+                gamma=args.milp_gamma
+            )
+            
+            print(f"\n{'='*80}")
+            print("Global MILP optimization completed!")
+            print(f"Assigned bit-widths to {len(global_bit_assignments)} layers")
+            print(f"{'='*80}\n")
+            
+        except Exception as e:
+            logger.error(f"Failed to solve global MILP: {e}")
+            print(f"Global MILP failed, falling back to uniform {args.wbits}-bit quantization")
+            # Fallback: use uniform quantization for all layers
+            for layer_name in alpha_values.keys():
+                global_bit_assignments[layer_name] = args.wbits
+    
     for i in range(len(layers)):
 
         print(f'Quantizing layer {i+1}/{len(layers)}..')
@@ -480,7 +523,6 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
         # Initialize variables
         low_bit_experts = []
         high_bit_experts = []
-        expert_bit_assignments = {}  # For no_calib_auto_programming mode
         
         # random generation
         if args.mixed_type == "random":
@@ -555,58 +597,8 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
             print(f"Layer {i}: High bit experts (alpha_sorted): {[expert_alpha_values[int(e.split('.')[-1])] for e in high_bit_experts]}")
             print(f"Layer {i}: Low bit experts (alpha_sorted): {[expert_alpha_values[int(e.split('.')[-1])] for e in low_bit_experts]}")
         elif args.mixed_type == "no_calib_auto_programming":
-            # Use MILP to automatically assign bit-widths based on alpha values
-            try:
-                # Parse candidate bits
-                candidate_bits = [int(s.strip()) for s in args.milp_candidate_bits.split(",") if s.strip()]
-                if not candidate_bits:
-                    raise ValueError("Empty candidate bits list")
-                
-                # Compute alpha values for expert modules in this layer
-                expert_alpha_values = {}
-                layer_name_prefix = f'model.layers.{i}.block_sparse_moe.experts.'
-                
-                # Get alpha values for all experts in this layer
-                for expert_idx in range(8):
-                    expert_prefix = f'{layer_name_prefix}{expert_idx}'
-                    # Get alpha values for all three weight matrices (w1, w2, w3)
-                    alpha_sum = 0.0
-                    count = 0
-                    for weight_name in ['w1', 'w2', 'w3']:
-                        weight_full_name = f'{expert_prefix}.{weight_name}'
-                        if weight_full_name in alpha_values:
-                            alpha_val = alpha_values[weight_full_name]
-                            # Check if alpha is valid
-                            if isinstance(alpha_val, (int, float)) and alpha_val == alpha_val and abs(alpha_val) != float('inf'):
-                                alpha_sum += alpha_val
-                                count += 1
-                    
-                    if count > 0:
-                        expert_alpha_values[expert_idx] = alpha_sum / count
-                    else:
-                        # If no valid alpha found, use a default value
-                        expert_alpha_values[expert_idx] = 0.0
-                
-                # Solve MILP for this layer
-                expert_bit_assignments = build_and_solve_milp_for_layer(
-                    expert_alphas=expert_alpha_values,
-                    candidate_bits=candidate_bits,
-                    bpp_budget=args.milp_bpp_budget,
-                    gamma=args.milp_gamma
-                )
-                
-                # Log the results
-                print(f"Layer {i}: MILP bit assignment:")
-                for expert_idx in sorted(expert_bit_assignments.keys()):
-                    bit = expert_bit_assignments[expert_idx]
-                    alpha_val = expert_alpha_values.get(expert_idx, 0.0)
-                    print(f"  Expert {expert_idx}: {bit} bits (alpha={alpha_val:.4f})")
-                
-            except Exception as e:
-                logger.error(f"Failed to solve MILP for layer {i}: {e}")
-                # Fallback: use uniform quantization
-                expert_bit_assignments = {idx: args.wbits for idx in range(8)}
-                print(f"Layer {i}: MILP failed, falling back to uniform {args.wbits}-bit quantization")
+            # Global MILP has already been solved, no per-layer processing needed
+            pass
 
 
         for names in sequential:
@@ -620,22 +612,14 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                     gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
                     gptq[name].wbits = args.wbits
                 elif args.mixed_type == "no_calib_auto_programming":
-                    # Use MILP-assigned bit-widths
-                    if name not in expert_modules:
-                        gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                        gptq[name].wbits = args.attn_bits
-                    else:
-                        # Extract expert index from name (e.g., "block_sparse_moe.experts.0.w1" -> 0)
-                        try:
-                            expert_name = name[:-3]  # Remove ".w1", ".w2", or ".w3"
-                            expert_idx = int(expert_name.split('.')[-1])
-                            assigned_bit = expert_bit_assignments.get(expert_idx, args.wbits)
-                            gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = assigned_bit
-                        except (ValueError, KeyError):
-                            # Fallback to default if parsing fails
-                            gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
-                            gptq[name].wbits = args.wbits
+                    # Use global MILP-assigned bit-widths
+                    # Construct full layer name: model.layers.{i}.{name}
+                    full_layer_name = f'model.layers.{i}.{name}'
+                    
+                    # Get the assigned bit-width from global assignment
+                    assigned_bit = global_bit_assignments.get(full_layer_name, args.wbits)
+                    gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                    gptq[name].wbits = assigned_bit
                 else:
                     if name not in expert_modules:
                         gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
@@ -667,19 +651,6 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
                 # quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), args.wbits, args.groupsize)
                 quantizers['model.layers.%d.%s' % (i, name)] = None
-                
-                # Collect bit assignment information for experts
-                if name in expert_modules:
-                    try:
-                        expert_name = name[:-3]  # Remove ".w1", ".w2", or ".w3"
-                        expert_idx = int(expert_name.split('.')[-1])
-                        if i not in layer_expert_bits:
-                            layer_expert_bits[i] = {}
-                        # Store the bit value (use wbits from gptq)
-                        # Note: w1, w2, w3 should have the same bit, so we can overwrite
-                        layer_expert_bits[i][expert_idx] = gptq[name].wbits
-                    except (ValueError, KeyError):
-                        pass  # Skip if parsing fails
                 if args.pack:
                     # real quant for compact memory
                     quant_config = BaseQuantizeConfig(nbits=gptq[name].wbits, group_size=args.groupsize)
@@ -708,14 +679,6 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
         print('\n')
 
     model.config.use_cache = use_cache
-    
-    # Save layer-expert bit assignments to file
-    if args.save_bit_assignments and layer_expert_bits:
-        bit_assignments_path = args.save_bit_assignments
-        logger.info(f"Saving bit assignments to: {bit_assignments_path}")
-        with open(bit_assignments_path, 'wb') as f:
-            pickle.dump(layer_expert_bits, f)
-        logger.info(f"Saved bit assignments for {len(layer_expert_bits)} layers")
 
     return quantizers
 
