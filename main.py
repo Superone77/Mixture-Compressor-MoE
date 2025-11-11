@@ -6,10 +6,9 @@ import logging
 import torch.nn as nn
 from transformers.models.mixtral.modeling_mixtral import MixtralForCausalLM
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-import csv
 import re
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Iterable
+from typing import Dict
 import math
 import random
 import pandas as pd
@@ -19,6 +18,7 @@ from modelutils import find_layers
 from datautils import get_loaders
 from quant.QLinear import *
 from loguru import logger
+from utils_alpha import compute_alpha_values
 
 try:
     import pulp  # MILP 建模与求解器接口
@@ -60,241 +60,8 @@ expert_modules = [
 ]
 
 
-# ========================
-# ======== MACROS ========
-# ========================
-# 方式一：直接改布尔开关
-USE_FARMS: bool = False
-
-# 方式二：用环境变量（优先级高于 USE_FARMS）
-#   export ALPHA_MODE=FARMS  或  BASELINE
-_env_mode = os.getenv("ALPHA_MODE", "").strip().upper()
-if _env_mode in {"FARMS", "BASELINE"}:
-    USE_FARMS = (_env_mode == "FARMS")
-
-# FARMS 的宏（也可用环境变量覆盖）
-FARMS_M_SUB: int   = int(os.getenv("FARMS_M_SUB", "128"))   # 子块行数 m'
-FARMS_N_SUB: int   = int(os.getenv("FARMS_N_SUB", "128"))   # 子块列数 n'
-FARMS_STRIDE_M: int = int(os.getenv("FARMS_STRIDE_M", str(FARMS_M_SUB)))  # 行步长
-FARMS_STRIDE_N: int = int(os.getenv("FARMS_STRIDE_N", str(FARMS_N_SUB)))  # 列步长
-FARMS_MAX_BLOCKS: int = int(os.getenv("FARMS_MAX_BLOCKS", "256"))         # 最多抽样子块数
-FARMS_RANDOM_SEED: Optional[int] = int(os.getenv("FARMS_SEED", "0")) if os.getenv("FARMS_SEED") else None
-
-# ================================
-# ======== Core Utilities ========
-# ================================
-
-def _ensure_2d_dense_weight(W: torch.Tensor) -> torch.Tensor:
-    if W.is_sparse:
-        W = W.to_dense()
-    if W.ndim > 2:
-        W = W.reshape(W.shape[0], -1)
-    return W
-
-@torch.no_grad()
-def _svd_eigs_baseline(W: torch.Tensor) -> torch.Tensor:
-    """
-    Baseline: 对整矩阵做 SVD，返回特征值（奇异值平方）升序张量 lam
-    """
-    W = _ensure_2d_dense_weight(W)
-    m, n = W.shape
-    if min(m, n) < 2:
-        return torch.tensor([], dtype=torch.float32)
-    W_ = W.to(dtype=torch.float32, device="cpu")
-    s = torch.linalg.svdvals(W_)
-    lam = (s ** 2)
-    lam, _ = torch.sort(lam)
-    return lam
-
-def _iter_farms_blocks_indices(m: int, n: int,
-                               m_sub: int, n_sub: int,
-                               stride_m: int, stride_n: int) -> Iterable[Tuple[int, int]]:
-    """
-    生成 FARMS 子块左上角坐标 (i, j)
-    """
-    if m_sub > m or n_sub > n:
-        return []
-    for i in range(0, m - m_sub + 1, max(1, stride_m)):
-        for j in range(0, n - n_sub + 1, max(1, stride_n)):
-            yield (i, j)
-
-@torch.no_grad()
-def _svd_eigs_farms(W: torch.Tensor,
-                    m_sub: int = FARMS_M_SUB,
-                    n_sub: int = FARMS_N_SUB,
-                    stride_m: int = FARMS_STRIDE_M,
-                    stride_n: int = FARMS_STRIDE_N,
-                    max_blocks: int = FARMS_MAX_BLOCKS,
-                    seed: Optional[int] = FARMS_RANDOM_SEED) -> torch.Tensor:
-    """
-    FARMS: 固定宽高比的子矩阵抽样 + 谱拼接。
-    返回拼接后（所有子块 SVD 的奇异值平方）的升序张量 lam_cat
-    """
-    W = _ensure_2d_dense_weight(W)
-    m, n = W.shape
-    if min(m, n) < 2:
-        return torch.tensor([], dtype=torch.float32)
-
-    # 如果矩阵本身比子块小，回退到 baseline（与 FARMS 目标等价）
-    if m_sub > m or n_sub > n:
-        return _svd_eigs_baseline(W)
-
-    # 生成所有候选子块索引
-    idx = list(_iter_farms_blocks_indices(m, n, m_sub, n_sub, stride_m, stride_n))
-    if len(idx) == 0:
-        return _svd_eigs_baseline(W)
-
-    # 控制计算量：必要时随机抽样若干子块
-    if seed is not None:
-        random.seed(seed)
-    if len(idx) > max_blocks:
-        idx = random.sample(idx, max_blocks)
-
-    W_cpu = W.to(dtype=torch.float32, device="cpu")
-
-    eig_list = []
-    for (i, j) in idx:
-        sub = W_cpu[i:i+m_sub, j:j+n_sub]
-        # 对子块做 SVD
-        s = torch.linalg.svdvals(sub)
-        lam = (s ** 2)
-        eig_list.append(lam)
-
-    if not eig_list:
-        return torch.tensor([], dtype=torch.float32)
-
-    lam_cat = torch.cat(eig_list, dim=0)
-    lam_cat, _ = torch.sort(lam_cat)
-    return lam_cat
-
-@torch.no_grad()
-def _hill_alpha_from_sorted_eigs(
-    lam_sorted: torch.Tensor,
-    k: Optional[int] = None,
-    k_frac: float = 0.1,
-    eps: float = 1e-12,
-) -> Tuple[float, int, int]:
-    """
-    对“升序特征值序列 lam_sorted”计算 Hill α。
-    返回: (alpha, k_used, n_eigs)
-    """
-    n_eigs = lam_sorted.numel()
-    if n_eigs < 2:
-        return float("nan"), 1, n_eigs
-
-    # 选择尾部样本数 k
-    k_used = max(10, int(n_eigs * k_frac)) if k is None else int(k)
-    k_used = max(1, min(k_used, n_eigs - 1))
-
-    # Hill 估计
-    eps_t = torch.tensor(eps, dtype=lam_sorted.dtype, device=lam_sorted.device)
-    lam_ref = torch.clamp(lam_sorted[-k_used-1], min=eps_t)
-    top = lam_sorted[-k_used:]
-    denom = torch.log(top / lam_ref).sum().clamp_min(eps_t)
-    alpha = float(1.0 + (k_used / float(denom)))
-    return alpha, k_used, n_eigs
-
-# =======================================
-# ======== Public API (macro-aware) =====
-# =======================================
-
-@torch.no_grad()
-def alpha_hill_from_weight(
-    W: torch.Tensor,
-    k: Optional[int] = None,
-    k_frac: float = 0.1,
-    eps: float = 1e-12,
-    *,
-    use_farms: Optional[bool] = None,
-    farms_m_sub: int = FARMS_M_SUB,
-    farms_n_sub: int = FARMS_N_SUB,
-    farms_stride_m: int = FARMS_STRIDE_M,
-    farms_stride_n: int = FARMS_STRIDE_N,
-    farms_max_blocks: int = FARMS_MAX_BLOCKS,
-    farms_seed: Optional[int] = FARMS_RANDOM_SEED,
-) -> Tuple[float, int, int]:
-    """
-    计算 PL_Alpha_Hill（支持 BASELINE 与 FARMS）。
-    - use_farms=None: 采用全局宏/环境变量；True/False: 强制指定。
-    返回: (alpha, k_used, n_eigs)，其中 n_eigs 为用于估计的特征值数量（整矩阵或拼接后）
-    """
-    mode_farms = USE_FARMS if use_farms is None else bool(use_farms)
-
-    if mode_farms:
-        lam_sorted = _svd_eigs_farms(
-            W, m_sub=farms_m_sub, n_sub=farms_n_sub,
-            stride_m=farms_stride_m, stride_n=farms_stride_n,
-            max_blocks=farms_max_blocks, seed=farms_seed
-        )
-    else:
-        lam_sorted = _svd_eigs_baseline(W)
-
-    if lam_sorted.numel() < 2:
-        # 回退值：最小信息
-        min_dim = min(W.shape[0], W.reshape(W.shape[0], -1).shape[1]) if W.ndim > 1 else 1
-        return float("nan"), 1, int(min_dim)
-
-    return _hill_alpha_from_sorted_eigs(lam_sorted, k=k, k_frac=k_frac, eps=eps)
-
-def compute_alpha_values(model: nn.Module, cache_dir: Optional[str] = None,
-                         *, use_farms: Optional[bool] = None) -> Dict[str, float]:
-    """为模型中所有线性层计算 α 值；支持宏/参数切换 FARMS 或 BASELINE。"""
-    cache_path = None
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-        # 把模式写入文件名，避免不同模式命中同一缓存
-        mode_tag = "farms" if (USE_FARMS if use_farms is None else use_farms) else "baseline"
-        cache_path = os.path.join(cache_dir, f"alpha_values_{mode_tag}.csv")
-        if os.path.exists(cache_path):
-            logger.info(f"Loading alpha values from cache: {cache_path}")
-            return load_alpha_from_csv(cache_path)
-
-    logger.info("Computing alpha values for all linear layers...")
-    results: Dict[str, float] = {}
-
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            weight = getattr(module, "weight", None)
-            if weight is None:
-                continue
-            try:
-                alpha, k_used, n_eigs = alpha_hill_from_weight(
-                    weight.detach(),
-                    use_farms=use_farms  # None=遵循宏；True/False=强制
-                )
-                results[name] = alpha
-            except Exception as e:
-                logger.warning(f"Failed to compute alpha for {name}: {e}")
-                results[name] = float("nan")
-
-    if cache_path:
-        logger.info(f"Saving alpha values to: {cache_path}")
-        save_alpha_to_csv(results, cache_path)
-
-    return results
-
-def save_alpha_to_csv(alpha_results: Dict[str, float], filename: str):
-    """保存 α 结果到 CSV。"""
-    with open(filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['layer_name', 'alpha'])
-        for name, alpha in alpha_results.items():
-            writer.writerow([name, alpha])
-
-def load_alpha_from_csv(filename: str) -> Dict[str, float]:
-    """从 CSV 读入 α 结果。"""
-    alpha_results: Dict[str, float] = {}
-    with open(filename, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                alpha_results[row['layer_name']] = float(row['alpha'])
-            except (ValueError, KeyError):
-                continue
-    return alpha_results
-
 def build_and_solve_global_milp(
-    layer_alpha_map: Dict[str, float],
+    layer_stats_map: Dict[str, Dict[str, float]],
     candidate_bits: list,
     bpp_budget: float,
     gamma: float = 1.0,
@@ -303,7 +70,7 @@ def build_and_solve_global_milp(
     为全局所有线性层计算MILP最优位宽分配。
     
     参数:
-        layer_alpha_map: {layer_name: alpha_value} 每个线性层的alpha值
+        layer_stats_map: {layer_name: {"alpha": float, "variance": float}} 每个线性层的统计信息
         candidate_bits: 候选位宽列表 [2,3,4,8]
         bpp_budget: 平均位宽预算
         gamma: 形状先验指数，默认1.0
@@ -314,13 +81,20 @@ def build_and_solve_global_milp(
     if pulp is None:
         raise ImportError("PuLP is required for MILP optimization. Install with: pip install pulp")
     
-    E = len(layer_alpha_map)
+    E = len(layer_stats_map)
     if E == 0:
         return {}
     
-    # 将layer_alpha_map转换为列表，保证顺序
-    layer_names = sorted(layer_alpha_map.keys())
-    alphas = [layer_alpha_map[name] for name in layer_names]
+    # 将 layer_stats_map 转换为列表，保证顺序
+    layer_names = sorted(layer_stats_map.keys())
+    alphas = []
+    variances = []
+    for name in layer_names:
+        stats = layer_stats_map[name]
+        alpha_val = float(stats.get("alpha", float("nan")))
+        variance_val = float(stats.get("variance", float("nan")))
+        alphas.append(alpha_val)
+        variances.append(variance_val)
     
     # 候选位宽检查
     candidate_bits = [int(b) for b in candidate_bits]
@@ -334,6 +108,8 @@ def build_and_solve_global_milp(
     alpha0 = float(pd.Series(alphas).median())
     eps = 1e-8
     sensitivities = [((alpha0 / max(a, eps)) ** gamma) for a in alphas]
+    var_eps = 1e-12
+    clamped_variances = [max(v, var_eps) for v in variances]
     
     # 构造代价表（无校准解析近似）
     q_b_scalar = {b: 2.0 ** (-2 * b) for b in candidate_bits}
@@ -351,8 +127,9 @@ def build_and_solve_global_milp(
     obj_terms = []
     for i in range(E):
         s_l = sensitivities[i]
+        v_l = clamped_variances[i]
         for b in candidate_bits:
-            obj_terms.append(x[(i, b)] * (s_l * q_b_scalar[b]))
+            obj_terms.append(x[(i, b)] * (s_l * v_l * q_b_scalar[b]))
     prob += pulp.lpSum(obj_terms), "Total_Cost"
     
     # 约束1：每层恰好选择一个位宽
@@ -476,16 +253,30 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 raise ValueError("Empty candidate bits list")
             
             # Filter valid alpha values (exclude NaN and inf)
-            valid_alpha_map = {}
-            for layer_name, alpha_val in alpha_values.items():
-                if isinstance(alpha_val, (int, float)) and alpha_val == alpha_val and abs(alpha_val) != float('inf'):
-                    valid_alpha_map[layer_name] = alpha_val
+            valid_layer_stats = {}
+            for layer_name, stats in alpha_values.items():
+                if isinstance(stats, dict):
+                    alpha_val = stats.get("alpha", float("nan"))
+                    variance_val = stats.get("variance", float("nan"))
+                else:
+                    alpha_val = stats
+                    variance_val = float("nan")
+                if (
+                    isinstance(alpha_val, (int, float))
+                    and math.isfinite(alpha_val)
+                    and isinstance(variance_val, (int, float))
+                    and math.isfinite(variance_val)
+                ):
+                    valid_layer_stats[layer_name] = {
+                        "alpha": float(alpha_val),
+                        "variance": float(variance_val),
+                    }
             
-            if not valid_alpha_map:
-                raise ValueError("No valid alpha values found")
+            if not valid_layer_stats:
+                raise ValueError("No valid alpha/variance statistics found")
             
             print(f"\n{'='*80}")
-            print(f"Running global MILP optimization for {len(valid_alpha_map)} layers...")
+            print(f"Running global MILP optimization for {len(valid_layer_stats)} layers...")
             print(f"Candidate bits: {candidate_bits}")
             print(f"BPP budget: {args.milp_bpp_budget}")
             print(f"Gamma: {args.milp_gamma}")
@@ -493,7 +284,7 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
             
             # Solve global MILP
             global_bit_assignments = build_and_solve_global_milp(
-                layer_alpha_map=valid_alpha_map,
+                layer_stats_map=valid_layer_stats,
                 candidate_bits=candidate_bits,
                 bpp_budget=args.milp_bpp_budget,
                 gamma=args.milp_gamma
@@ -571,11 +362,15 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                 count = 0
                 for weight_name in ['w1', 'w2', 'w3']:
                     weight_full_name = f'{expert_prefix}.{weight_name}'
-                    if weight_full_name in alpha_values:
-                        alpha_val = alpha_values[weight_full_name]
+                    stats = alpha_values.get(weight_full_name)
+                    if stats is not None:
+                        if isinstance(stats, dict):
+                            alpha_val = stats.get("alpha", float("nan"))
+                        else:
+                            alpha_val = stats
                         # Check if alpha is valid (not NaN and not infinite)
-                        if isinstance(alpha_val, (int, float)) and alpha_val == alpha_val and abs(alpha_val) != float('inf'):
-                            alpha_sum += alpha_val
+                        if isinstance(alpha_val, (int, float)) and math.isfinite(alpha_val):
+                            alpha_sum += float(alpha_val)
                             count += 1
                 
                 if count > 0:
