@@ -162,7 +162,7 @@ def build_and_solve_global_milp(
         if chosen_b is None:
             raise RuntimeError(f"Layer {layer_name} 未选定位宽。")
         assignment[layer_name] = chosen_b
-    
+    print(assignment)    
     return assignment
 
 
@@ -267,11 +267,12 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
                     and isinstance(variance_val, (int, float))
                     and math.isfinite(variance_val)
                 ):
-                    valid_layer_stats[layer_name] = {
-                        "alpha": float(alpha_val),
-                        "variance": float(variance_val),
-                    }
-            
+                    if "block_sparse_moe.experts" in layer_name:
+                        valid_layer_stats[layer_name] = {
+                            "alpha": float(alpha_val),
+                            "variance": float(variance_val),
+                        }
+                    
             if not valid_layer_stats:
                 raise ValueError("No valid alpha/variance statistics found")
             
@@ -544,11 +545,11 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
         for layer_idx in sorted(layer_expert_bits.keys()):
             for expert_id in sorted(layer_expert_bits[layer_idx].keys()):
                 bits = layer_expert_bits[layer_idx][expert_id]
-                avg_bit = sum(bits) / len(bits)
+                # avg_bit = sum(bits) / len(bits)
                 csv_data.append({
                     'layer': layer_idx,
                     'expert_id': expert_id,
-                    'bit': round(avg_bit, 2)
+                    'bit': bits
                 })
         
         # Save to CSV

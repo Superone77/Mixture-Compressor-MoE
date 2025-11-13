@@ -18,7 +18,8 @@ from datautils import get_loaders
 from quant.QLinear import *
 from loguru import logger
 from utils_alpha import compute_alpha_values
-
+from deepseek_moe.modeling_deepseek import DeepseekV2ForCausalLM
+from deepseek_moe.configuration_deepseek import DeepseekV2Config
 try:
     import pulp  # MILP 建模与求解器接口
 except ImportError as e:
@@ -31,6 +32,12 @@ atten_modules = [
     "self_attn.kv_a_proj_with_mqa",
     "self_attn.kv_b_proj",
     "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.down_proj",
+    "mlp.up_proj"
+    "mlp.shared_experts.gate_proj",
+    "mlp.shared_experts.down_proj",
+    "mlp.shared_experts.up_proj",
 ]
 
 # DeepSeek expert modules - 64 experts, each with gate_proj, up_proj, down_proj
@@ -158,11 +165,11 @@ def get_model():
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
 
-    config = AutoConfig.from_pretrained(
-        args.model, attn_implementation=args.attn_implementation
+    config = DeepseekV2Config.from_pretrained(
+        args.model, attn_implementation=args.attn_implementation,trust_remote_code=True
     )
-    model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
-
+    model = DeepseekV2ForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16,trust_remote_code=True)
+    print(model)
     # DeepSeek model check - use model type from config instead of isinstance
     model_type = getattr(config, 'model_type', '').lower()
     if 'deepseek' not in model_type:
@@ -514,6 +521,10 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
                             expert_idx = int(name_parts[2])
                             _module = experts[expert_idx]
                             linear_layer = getattr(_module, name_parts[3])
+                        # DeepSeek shared expert layer:  mlp.shared_experts.gate_proj
+                        elif "shared_experts" in name_parts:
+                            _module = getattr(layer.mlp, "shared_experts")
+                            linear_layer = getattr(_module, name_parts[-1])
                         else:
                             # Fallback for other layers (e.g., mlp.gate_proj, mlp.up_proj, mlp.down_proj for layer 0)
                             _module = getattr(layer, name_parts[0])
@@ -801,7 +812,7 @@ if __name__ == "__main__":
             # For uniform or other modes, use wbits directly
             saving_path = args.saving_path + f"-atten_{args.attn_bits}-e_{args.wbits}"
         
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         tokenizer.save_pretrained(saving_path)
         from utils.pack import save_quantized
         save_quantized(model, saving_path)
