@@ -409,24 +409,45 @@ def mixtral_sequential(model, dataloader, dev, bit_config=None):
 
                 if args.mixed_type == "uniform":
                     # Configure quantization based on layer split option
-                    if args.half_layers_expert_split:
-                        # Split layers in half: first half uses wbits+1, second half uses wbits for experts
-                        total_layers = len(layers)
-                        if name not in expert_modules:
-                            # Attention layers: keep original attn_bits
-                            assigned_bit = args.attn_bits
+                    total_layers = len(layers)
+                    is_first_half = i < total_layers // 2
+                    is_expert = name in expert_modules
+                    
+                    # Check if custom bit widths are specified
+                    if args.half_layers_high_bits is not None or args.half_layers_low_bits is not None:
+                        # Use custom bit widths
+                        if args.half_layers_apply_to_all:
+                            # Apply to all layers (attention and expert)
+                            if is_first_half:
+                                assigned_bit = args.half_layers_high_bits if args.half_layers_high_bits is not None else (args.wbits + 1)
+                            else:
+                                assigned_bit = args.half_layers_low_bits if args.half_layers_low_bits is not None else args.wbits
                         else:
-                            # Expert layers: first half uses wbits+1, second half uses wbits
-                            if i < total_layers // 2:
+                            # Apply only to expert layers
+                            if is_expert:
+                                if is_first_half:
+                                    assigned_bit = args.half_layers_high_bits if args.half_layers_high_bits is not None else (args.wbits + 1)
+                                else:
+                                    assigned_bit = args.half_layers_low_bits if args.half_layers_low_bits is not None else args.wbits
+                            else:
+                                # Attention layers: keep original attn_bits
+                                assigned_bit = args.attn_bits
+                    elif args.half_layers_expert_split:
+                        # Original behavior: split layers in half for experts only
+                        if is_expert:
+                            if is_first_half:
                                 assigned_bit = args.wbits + 1  # First half layers
                             else:
                                 assigned_bit = args.wbits  # Second half layers
+                        else:
+                            # Attention layers: keep original attn_bits
+                            assigned_bit = args.attn_bits
                     else:
                         # Default: use wbits for experts, attn_bits for attention
-                        if name not in expert_modules:
-                            assigned_bit = args.attn_bits
-                        else:
+                        if is_expert:
                             assigned_bit = args.wbits
+                        else:
+                            assigned_bit = args.attn_bits
                     
                     gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
                     gptq[name].wbits = assigned_bit
@@ -725,6 +746,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--half_layers_expert_split", action="store_true",
         help="If enabled, split layers in half: first half uses wbits+1 for experts, second half uses wbits. Attention layers keep original attn_bits."
+    )
+    parser.add_argument(
+        "--half_layers_high_bits", type=int, default=None,
+        help="Bit width for first half layers (overrides wbits+1 in half_layers_expert_split mode). If set, applies to expert layers."
+    )
+    parser.add_argument(
+        "--half_layers_low_bits", type=int, default=None,
+        help="Bit width for second half layers (overrides wbits in half_layers_expert_split mode). If set, applies to expert layers."
+    )
+    parser.add_argument(
+        "--half_layers_apply_to_all", action="store_true",
+        help="If enabled with half_layers_high_bits/low_bits, applies bit split to all layers (including attention layers), not just expert layers."
     )
 
     args = parser.parse_args()
