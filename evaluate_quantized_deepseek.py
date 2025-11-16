@@ -70,6 +70,13 @@ def parse_args():
         action="store_true",
         help="If set, load the original (non-quantized) model in bfloat16 like deepseek_main.py and evaluate.",
     )
+    parser.add_argument(
+        "--device_map",
+        type=str,
+        default="none",
+        choices=["none", "auto"],
+        help="Placement strategy for quantized path. Use 'auto' to shard across multiple GPUs with accelerate.",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +106,7 @@ def load_quantized_deepseek(
     attn_implementation: str = "eager",
     device: str = "cuda",
     compute_dtype: torch.dtype = torch.float16,
+    device_map: str = "none",
 ):
     """
     Load a DeepSeek quantized model saved by deepseek_main.py using local deepseek_moe definitions.
@@ -117,7 +125,9 @@ def load_quantized_deepseek(
     # 2) Load serialized quantized weights
     weights = load_weights(save_dir, map_location="cpu")
 
-    target_device = device if device.startswith("cuda") or device == "cpu" else "cuda"
+    use_auto_shard = (device_map == "auto") and torch.cuda.is_available() and torch.cuda.device_count() > 1
+    # When auto sharding, first materialize on CPU and later dispatch to GPUs
+    target_device = "cpu" if use_auto_shard else (device if device.startswith("cuda") or device == "cpu" else "cuda")
 
     # 3) Name modules and apply weights
     # Ensure each module has .name for convenience
@@ -159,8 +169,20 @@ def load_quantized_deepseek(
         if new_module is not current:
             _set_module(model, name, new_module)
 
-    # 5) Move remaining modules to device/dtype
-    model.to(device=target_device, dtype=compute_dtype, non_blocking=True)
+    # 5) Placement
+    if use_auto_shard:
+        try:
+            from accelerate.utils import infer_auto_device_map, get_balanced_memory
+            from accelerate import dispatch_model
+            print("Using accelerate to shard model across GPUs (device_map=auto)")
+            max_memory = get_balanced_memory(model, dtype=compute_dtype)
+            inferred_map = infer_auto_device_map(model, max_memory=max_memory, dtype=compute_dtype, no_split_module_classes=None)
+            model = dispatch_model(model, device_map=inferred_map)
+        except Exception as e:
+            print(f"Auto sharding failed ({e}). Falling back to single device placement.")
+            model.to(device="cuda" if torch.cuda.is_available() else "cpu", dtype=compute_dtype, non_blocking=True)
+    else:
+        model.to(device=target_device, dtype=compute_dtype, non_blocking=True)
     model.eval()
     return model
 
@@ -178,6 +200,7 @@ def main():
     print(f"Attention impl: {args.attn_implementation}")
     print(f"Dtype: {args.dtype}")
     print(f"Evaluate bf16 original model: {args.evaluate_bf16}")
+    print(f"Device map (quantized path): {args.device_map}")
     print("=" * 80)
 
     # Two evaluation modes:
@@ -209,6 +232,7 @@ def main():
             attn_implementation=args.attn_implementation,
             device=args.device,
             compute_dtype=compute_dtype,
+            device_map=args.device_map,
         )
         model.eval()
         # Load tokenizer saved alongside quantized model
