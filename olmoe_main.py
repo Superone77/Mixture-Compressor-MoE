@@ -4,6 +4,283 @@ import time
 import torch
 import logging
 import torch.nn as nn
+from transformers import AutoTokenizer
+import re
+from pathlib import Path
+from typing import Dict
+import math
+import random
+import pandas as pd
+
+from gptq import GPTQ
+from modelutils import find_layers
+from datautils import get_loaders
+from quant.QLinear import *
+from loguru import logger
+
+from olmoe.modeling_olmoe import OlmoeForCausalLM
+from olmoe.configuration_olmoe import OlmoeConfig
+
+
+# OLMoE attention modules
+atten_modules = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+]
+
+
+def get_model():
+    import torch
+    def skip(*args, **kwargs):
+        pass
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+
+    config = OlmoeConfig.from_pretrained(
+        args.model, attn_implementation=args.attn_implementation, trust_remote_code=True
+    )
+    model = OlmoeForCausalLM.from_pretrained(
+        args.model,
+        config=config,
+        device_map="cpu",
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    print(model)
+    model_type = getattr(config, "model_type", "").lower()
+    if "olmoe" not in model_type:
+        logger.warning(f"Model type is {model_type}, expected olmoe model")
+    model.seqlen = getattr(config, "max_position_embeddings", 2048)
+    return model
+
+
+@torch.no_grad()
+def olmoe_sequential(model, dataloader, dev):
+    print('Starting ...')
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+
+    model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    model.model.norm = model.model.norm.to(dev)
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev)
+    cache = {'i': 0, 'attention_mask': None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+
+    layers[0] = layers[0].cpu()
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    model.model.norm = model.model.norm.cpu()
+    torch.cuda.empty_cache()
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+    print('Ready.')
+    quantizers = {}
+
+    for i in range(len(layers)):
+        print(f'Quantizing layer {i+1}/{len(layers)}..')
+        print('+--------------------------------+------------+------------+------------+---------+')
+        print('|              name              |weight_error| fp_inp_SNR | q_inp_SNR  |  time   |')
+        print('+================================+============+============+============+=========+')
+
+        layer = layers[i].to(dev)
+        full = find_layers(layer)
+
+        # Restrict to known attention projections; OLMoE expert weights are parameter-based, not nn.Linear
+        names_to_quant = [name for name in full.keys() if name in atten_modules]
+        if not names_to_quant:
+            # Nothing to quantize in this layer; proceed
+            for j in range(args.nsamples):
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            layers[i] = layer.cpu()
+            del layer
+            torch.cuda.empty_cache()
+            inps, outs = outs, inps
+            print('+--------------------------------+------------+------------+------------+---------+')
+            print('\n')
+            continue
+
+        sequential = [names_to_quant]
+
+        for names in sequential:
+            subset = {n: full[n] for n in names}
+            gptq = {}
+            for name in subset:
+                gptq[name] = GPTQ(subset[name], logger, name, args.wbits)
+                assigned_bit = args.attn_bits if name in atten_modules else args.wbits
+                gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                gptq[name].wbits = assigned_bit
+
+            def add_batch(name):
+                def tmp(_, inp, out):
+                    gptq[name].add_batch(inp[0].data, out.data)
+                return tmp
+            handles = []
+            for name in subset:
+                handles.append(subset[name].register_forward_hook(add_batch(name)))
+            for j in range(args.nsamples):
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            for h in handles:
+                h.remove()
+
+            for name in subset:
+                scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name)
+                quantizers['model.layers.%d.%s' % (i, name)] = None
+                if args.pack:
+                    quant_config = BaseQuantizeConfig(nbits=gptq[name].wbits, group_size=args.groupsize)
+                    name_parts = name.split('.')
+                    # attention path: self_attn.{proj}
+                    _module = getattr(layer, name_parts[-2])
+                    linear_layer = getattr(_module, name_parts[-1])
+                    quant_layer = QLinear(quant_config=quant_config, device=linear_layer.weight.device)
+                    quant_layer.replace_quantized_weight(linear_layer.weight, scale, zero)
+                    setattr(_module, name_parts[-1], quant_layer)
+                    print(getattr(_module, name_parts[-1]).W_q.dtype)
+                gptq[name].free()
+
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        layers[i] = layer.cpu()
+        del layer
+        del gptq
+        torch.cuda.empty_cache()
+        inps, outs = outs, inps
+        print('+--------------------------------+------------+------------+------------+---------+')
+        print('\n')
+
+    model.config.use_cache = use_cache
+    return quantizers
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "model", type=str, help="model to load; for example `allenai/OLMoE-1B-7B-0924`."
+    )
+    parser.add_argument(
+        "--wbits",
+        type=str,
+        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit"],
+        help="weight bit-width",
+    )
+    parser.add_argument(
+        "--attn_bits",
+        type=str,
+        choices=["1bit", "2bit", "3bit", "4bit", "5bit", "6bit", "7bit", "8bit"],
+        help="attention weight bit-width",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["wikitext2", "ptb", "c4", "gsm8k", "mix"],
+        help="Where to extract calibration data from.",
+    )
+    parser.add_argument("--gsm8k_field", type=str, choices=["question", "answer"], default="question")
+    parser.add_argument("--load_quantized", action="store_true")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for sampling the calibration data.")
+    parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
+    parser.add_argument("--percdamp", type=float, default=0.01, help="Percent of the average Hessian diagonal to use for dampening.")
+    parser.add_argument("--groupsize", type=int, default=128, help="Group size")
+    parser.add_argument("--num_fewshot", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=1, help="batch size.")
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        required=False,
+        default="eager",
+        choices=["eager", "sdpa", "flash_attention_2"],
+        help="attention implementation that the model works with",
+    )
+    parser.add_argument('--sym', action='store_true', help='Whether to perform symmetric quantization.')
+    parser.add_argument('--act-order', action='store_true', help='Whether to apply the activation order GPTQ heuristic')
+    parser.add_argument("--multigpu", action="store_true")
+    parser.add_argument("--eval_ppl", action="store_true", help="Evaluate perplexity.")
+    parser.add_argument("--tasks", type=str, default="", help="Test datasets")
+    parser.add_argument("--save", action="store_true")
+    parser.add_argument("--pack", action="store_true", help="Whether to save the packed model.")
+    parser.add_argument("--saving_path", type=str, help="the saving path of quantized model")
+
+    args = parser.parse_args()
+    print(f'Arguments: {args}')
+
+    if args.dataset == "gsm8k":
+        os.environ["GSM8K_FIELD"] = args.gsm8k_field
+
+    groupsize = args.groupsize
+    args.wbits = int(args.wbits[0])
+    args.attn_bits = int(args.attn_bits[0])
+
+    model = get_model()
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+
+    dataloader, testloader = get_loaders(
+        args.dataset,
+        nsamples=args.nsamples,
+        seed=args.seed,
+        model=args.model,
+        seqlen=model.seqlen,
+    )
+    device = "cuda:0"
+    tick = time.time()
+    quantizers = olmoe_sequential(model, dataloader, device)
+    print("quantization time:", time.time() - tick, "s")
+    print(model)
+
+    if args.eval_ppl:
+        for dataset in ["wikitext2"]:
+            dataloader, testloader = get_loaders(
+                dataset, seed=args.seed, seqlen=2048, model=args.model
+            )
+            print(dataset)
+            from eval_ppl_utils import llama_eval
+            t1 = time.time()
+            llama_eval(model, testloader, device, dataset)
+            print("Time: ", time.time() - t1)
+    if args.save:
+        saving_path = args.saving_path + f"-atten_{args.attn_bits}-e_{args.wbits}"
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        tokenizer.save_pretrained(saving_path)
+        from utils.pack import save_quantized
+        save_quantized(model, saving_path)
+
+import os
+import pickle
+import time
+import torch
+import logging
+import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import re
 from pathlib import Path
