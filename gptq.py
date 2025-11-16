@@ -153,7 +153,9 @@ class GPTQ:
                         zero.append(self.quantizer.zero)
                         now_idx += 1
                 if self.quantizer.pack:
-                    q, s, z = self.quantizer.quantize(w.unsqueeze(1))
+                    _res = self.quantizer.quantize(w.unsqueeze(1))
+                    # Support quantizers that return more than 3 values (e.g., g_idx)
+                    q, s, z = _res[0], _res[1], _res[2]
                     q_r = s * (q - z)
                     q_r = q_r.flatten()
                     q = q.flatten()
