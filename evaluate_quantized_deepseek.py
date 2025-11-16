@@ -65,6 +65,11 @@ def parse_args():
         choices=["float16", "bfloat16", "float32"],
         help="Computation dtype",
     )
+    parser.add_argument(
+        "--evaluate_bf16",
+        action="store_true",
+        help="If set, load the original (non-quantized) model in bfloat16 like deepseek_main.py and evaluate.",
+    )
     return parser.parse_args()
 
 
@@ -172,21 +177,42 @@ def main():
     print(f"Device: {args.device}")
     print(f"Attention impl: {args.attn_implementation}")
     print(f"Dtype: {args.dtype}")
+    print(f"Evaluate bf16 original model: {args.evaluate_bf16}")
     print("=" * 80)
 
-    compute_dtype = _torch_dtype_from_str(args.dtype)
-
-    # Load quantized DeepSeek model
-    print(f"\nLoading quantized DeepSeek model from: {args.model_path}")
-    model = load_quantized_deepseek(
-        args.model_path,
-        attn_implementation=args.attn_implementation,
-        device=args.device,
-        compute_dtype=compute_dtype,
-    )
-
-    # Load tokenizer saved alongside quantized model
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    # Two evaluation modes:
+    # - Quantized evaluation (default): load from quantized directory using serialized qmodel
+    # - BF16 evaluation (--evaluate_bf16): load original model like deepseek_main.py and evaluate in bf16
+    if args.evaluate_bf16:
+        print(f"\nLoading bf16 original DeepSeek model from: {args.model_path}")
+        config = DeepseekV2Config.from_pretrained(
+            args.model_path,
+            attn_implementation=args.attn_implementation,
+            trust_remote_code=True,
+        )
+        # Mirror deepseek_main.py behavior but use bfloat16 as requested
+        model = DeepseekV2ForCausalLM.from_pretrained(
+            args.model_path,
+            config=config,
+            device_map="auto" if args.device.startswith("cuda") else None,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        compute_dtype = torch.bfloat16
+    else:
+        compute_dtype = _torch_dtype_from_str(args.dtype)
+        print(f"\nLoading quantized DeepSeek model from: {args.model_path}")
+        model = load_quantized_deepseek(
+            args.model_path,
+            attn_implementation=args.attn_implementation,
+            device=args.device,
+            compute_dtype=compute_dtype,
+        )
+        model.eval()
+        # Load tokenizer saved alongside quantized model
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     # Prepare tasks
     task_list = [task.strip() for task in args.tasks.split(",") if task.strip()]
