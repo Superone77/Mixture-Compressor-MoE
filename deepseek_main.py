@@ -156,6 +156,145 @@ def build_and_solve_global_milp(
     return assignment
 
 
+def build_and_solve_expert_level_milp(
+    layer_stats_map: Dict[str, Dict[str, float]],
+    candidate_bits: list,
+    bpp_budget: float,
+    gamma: float = 1.0,
+) -> Dict[str, int]:
+    """
+    为每个expert计算MILP最优位宽分配。
+    
+    参数:
+        layer_stats_map: {layer_name: {"alpha": float, "variance": float}} 每个线性层的统计信息
+        candidate_bits: 候选位宽列表 [2,3,4,8]
+        bpp_budget: 平均位宽预算
+        gamma: 形状先验指数，默认1.0
+    
+    返回:
+        assignment: {expert_id: chosen_bit} 每个expert分配到的位宽，expert_id格式为 "layer_{i}_expert_{j}"
+    """
+    if pulp is None:
+        raise ImportError("PuLP is required for MILP optimization. Install with: pip install pulp")
+    
+    # 按expert分组，提取layer_idx和expert_idx
+    # layer_name格式: model.layers.{i}.mlp.experts.{j}.gate_proj/up_proj/down_proj
+    expert_stats = {}  # {(layer_idx, expert_idx): {"alpha": sum, "variance": sum}}
+    
+    pattern = re.compile(r'model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)')
+    
+    for layer_name, stats in layer_stats_map.items():
+        match = pattern.match(layer_name)
+        if match:
+            layer_idx = int(match.group(1))
+            expert_idx = int(match.group(2))
+            weight_name = match.group(3)
+            
+            # 只处理gate_proj, up_proj, down_proj
+            if weight_name not in ['gate_proj', 'up_proj', 'down_proj']:
+                continue
+            
+            expert_key = (layer_idx, expert_idx)
+            if expert_key not in expert_stats:
+                expert_stats[expert_key] = {"alpha": 0.0, "variance": 0.0}
+            
+            # 累加alpha和variance
+            if isinstance(stats, dict):
+                alpha_val = stats.get("alpha", float("nan"))
+                variance_val = stats.get("variance", float("nan"))
+            else:
+                alpha_val = stats
+                variance_val = float("nan")
+            
+            if isinstance(alpha_val, (int, float)) and math.isfinite(alpha_val):
+                expert_stats[expert_key]["alpha"] += float(alpha_val)
+            if isinstance(variance_val, (int, float)) and math.isfinite(variance_val):
+                expert_stats[expert_key]["variance"] += float(variance_val)
+    
+    E = len(expert_stats)
+    if E == 0:
+        return {}
+    
+    # 将expert_stats转换为列表，保证顺序
+    expert_keys = sorted(expert_stats.keys())
+    alphas = []
+    variances = []
+    for key in expert_keys:
+        stats = expert_stats[key]
+        alphas.append(stats["alpha"])
+        variances.append(stats["variance"])
+    
+    # 候选位宽检查
+    candidate_bits = [int(b) for b in candidate_bits]
+    if any(b <= 0 for b in candidate_bits):
+        raise ValueError("候选位宽必须为正整数。")
+    min_bit = min(candidate_bits)
+    if bpp_budget < min_bit:
+        raise ValueError(f"预算不可行：bpp_budget={bpp_budget} 小于最小位宽 {min_bit}。")
+    
+    # 计算形状先验敏感度
+    alpha0 = float(pd.Series(alphas).median())
+    eps = 1e-8
+    sensitivities = [((alpha0 / max(a, eps)) ** gamma) for a in alphas]
+    var_eps = 1e-12
+    clamped_variances = [max(v, var_eps) for v in variances]
+    
+    # 构造代价表（无校准解析近似）
+    q_b_scalar = {b: 2.0 ** (-2 * b) for b in candidate_bits}
+    
+    # 建立 MILP 模型
+    prob = pulp.LpProblem("NoCalib_ExpertLevel", pulp.LpMinimize)
+    
+    # 二元决策变量 x_{e,b}
+    x = {}
+    for i in range(E):
+        for b in candidate_bits:
+            x[(i, b)] = pulp.LpVariable(f"x_{i}_{b}", lowBound=0, upBound=1, cat=pulp.LpBinary)
+    
+    # 目标函数：sum_e sum_b x_{e,b} * s_e * q_{e,b}
+    obj_terms = []
+    for i in range(E):
+        s_e = sensitivities[i]
+        v_e = clamped_variances[i]
+        for b in candidate_bits:
+            obj_terms.append(x[(i, b)] * (s_e * v_e * q_b_scalar[b]))
+    prob += pulp.lpSum(obj_terms), "Total_Cost"
+    
+    # 约束1：每个expert恰好选择一个位宽
+    for i in range(E):
+        prob += pulp.lpSum([x[(i, b)] for b in candidate_bits]) == 1, f"one_bit_{i}"
+    
+    # 约束2：平均位宽预算
+    prob += pulp.lpSum([x[(i, b)] * b for i in range(E) for b in candidate_bits]) <= bpp_budget * E, "bit_budget"
+    
+    # 求解
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    status = prob.solve(solver)
+    
+    # 检查求解状态
+    lp_status = pulp.LpStatus[status]
+    if lp_status != "Optimal":
+        raise RuntimeError(
+            f"求解失败：LpStatus={lp_status}。"
+            f"建议：提高 bpp_budget 或调整候选位宽范围。"
+        )
+    
+    # 解析结果
+    assignment = {}
+    for i, expert_key in enumerate(expert_keys):
+        layer_idx, expert_idx = expert_key
+        expert_id = f"layer_{layer_idx}_expert_{expert_idx}"
+        chosen_b = None
+        for b in candidate_bits:
+            if pulp.value(x[(i, b)]) >= 0.5:
+                chosen_b = b
+                break
+        if chosen_b is None:
+            raise RuntimeError(f"Expert {expert_id} 未选定位宽。")
+        assignment[expert_id] = chosen_b
+    print(assignment)
+    return assignment
+
 
 def get_model():
     import torch
@@ -193,7 +332,7 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
     
     # Compute alpha values if needed
     alpha_values = None
-    if args.mixed_type == "mixed_with_alpha" or args.mixed_type == "no_calib_auto_programming":
+    if args.mixed_type == "mixed_with_alpha" or args.mixed_type == "no_calib_auto_programming" or args.mixed_type == "no_calib_auto_programming_expert_level":
         alpha_values = compute_alpha_values(model, cache_dir=args.cache_dir)
         print(f"Computed alpha values for {len(alpha_values)} layers")
 
@@ -242,6 +381,9 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
     
     # Global bit-width assignment for no_calib_auto_programming mode
     global_bit_assignments = {}
+    # Expert-level bit-width assignment for no_calib_auto_programming_expert_level mode
+    expert_bit_assignments = {}  # {(layer_idx, expert_idx): bit_width}
+    
     if args.mixed_type == "no_calib_auto_programming":
         try:
             # Parse candidate bits
@@ -298,6 +440,181 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
             # Fallback: use uniform quantization for all layers
             for layer_name in alpha_values.keys():
                 global_bit_assignments[layer_name] = args.wbits
+    elif args.mixed_type == "no_calib_auto_programming_expert_level":
+        try:
+            # Parse candidate bits
+            candidate_bits = [int(s.strip()) for s in args.milp_candidate_bits.split(",") if s.strip()]
+            if not candidate_bits:
+                raise ValueError("Empty candidate bits list")
+            
+            # Filter valid alpha values for expert layers only (gate_proj, up_proj, down_proj)
+            valid_layer_stats = {}
+            for layer_name, stats in alpha_values.items():
+                if isinstance(stats, dict):
+                    alpha_val = stats.get("alpha", float("nan"))
+                    variance_val = stats.get("variance", float("nan"))
+                else:
+                    alpha_val = stats
+                    variance_val = float("nan")
+                if (
+                    isinstance(alpha_val, (int, float))
+                    and math.isfinite(alpha_val)
+                    and isinstance(variance_val, (int, float))
+                    and math.isfinite(variance_val)
+                ):
+                    # Only include expert weight layers (gate_proj, up_proj, down_proj)
+                    if "mlp.experts" in layer_name and (layer_name.endswith(".gate_proj") or layer_name.endswith(".up_proj") or layer_name.endswith(".down_proj")):
+                        valid_layer_stats[layer_name] = {
+                            "alpha": float(alpha_val),
+                            "variance": float(variance_val),
+                        }
+                    
+            if not valid_layer_stats:
+                raise ValueError("No valid alpha/variance statistics found for expert layers")
+            
+            print(f"\n{'='*80}")
+            print(f"Running expert-level MILP optimization for {len(valid_layer_stats)} expert weight layers...")
+            print(f"Candidate bits: {candidate_bits}")
+            print(f"BPP budget: {args.milp_bpp_budget}")
+            print(f"Gamma: {args.milp_gamma}")
+            print(f"{'='*80}\n")
+            
+            # Solve expert-level MILP
+            expert_assignments = build_and_solve_expert_level_milp(
+                layer_stats_map=valid_layer_stats,
+                candidate_bits=candidate_bits,
+                bpp_budget=args.milp_bpp_budget,
+                gamma=args.milp_gamma
+            )
+            
+            # Convert expert_id string format to (layer_idx, expert_idx) tuple format
+            pattern = re.compile(r'layer_(\d+)_expert_(\d+)')
+            for expert_id, bit_width in expert_assignments.items():
+                match = pattern.match(expert_id)
+                if match:
+                    layer_idx = int(match.group(1))
+                    expert_idx = int(match.group(2))
+                    expert_bit_assignments[(layer_idx, expert_idx)] = bit_width
+            
+            print(f"\n{'='*80}")
+            print("Expert-level MILP optimization completed!")
+            print(f"Assigned bit-widths to {len(expert_bit_assignments)} experts")
+            print(f"{'='*80}\n")
+            
+        except Exception as e:
+            logger.error(f"Failed to solve expert-level MILP: {e}")
+            print(f"Expert-level MILP failed, falling back to uniform {args.wbits}-bit quantization")
+            # Fallback: use uniform quantization for all experts
+            # We'll set this during quantization loop if needed
+    
+    # Pre-populate bit_assignments before GPTQ loop if save_bit_assignments is enabled
+    if args.save_bit_assignments:
+        if args.mixed_type == "no_calib_auto_programming":
+            # Extract bit assignments from global_bit_assignments for all expert layers
+            for i in range(len(layers)):
+                for expert_idx in range(num_experts):
+                    # Check all three weight matrices (gate_proj, up_proj, down_proj) - they may have different bits
+                    for weight_name in ['gate_proj', 'up_proj', 'down_proj']:
+                        full_layer_name = f'model.layers.{i}.mlp.experts.{expert_idx}.{weight_name}'
+                        assigned_bit = global_bit_assignments.get(full_layer_name, args.wbits)
+                        bit_assignments.append((i, expert_idx, assigned_bit))
+        elif args.mixed_type == "no_calib_auto_programming_expert_level":
+            # Extract bit assignments from expert_bit_assignments
+            for i in range(len(layers)):
+                for expert_idx in range(num_experts):
+                    assigned_bit = expert_bit_assignments.get((i, expert_idx), args.wbits)
+                    # All three weight matrices (gate_proj, up_proj, down_proj) use the same bit-width
+                    # Only track once per expert
+                    bit_assignments.append((i, expert_idx, assigned_bit))
+        elif args.mixed_type == "uniform":
+            # Pre-populate uniform bit assignments
+            for i in range(len(layers)):
+                for expert_idx in range(num_experts):
+                    if args.half_layers_expert_split:
+                        total_layers = len(layers)
+                        if i < total_layers // 2:
+                            assigned_bit = args.wbits + 1
+                        else:
+                            assigned_bit = args.wbits
+                    else:
+                        assigned_bit = args.wbits
+                    # Only track once per expert (gate_proj, up_proj, down_proj all have same bit)
+                    bit_assignments.append((i, expert_idx, assigned_bit))
+        elif args.mixed_type == "mixed_with_alpha":
+            # Pre-populate based on alpha values
+            for i in range(len(layers)):
+                expert_alpha_values = {}
+                layer_name_prefix = f'model.layers.{i}.mlp.experts.'
+                
+                # Get alpha values for all experts in this layer
+                for expert_idx in range(num_experts):
+                    expert_prefix = f'{layer_name_prefix}{expert_idx}'
+                    alpha_sum = 0.0
+                    count = 0
+                    for weight_name in ['gate_proj', 'up_proj', 'down_proj']:
+                        weight_full_name = f'{expert_prefix}.{weight_name}'
+                        stats = alpha_values.get(weight_full_name)
+                        if stats is not None:
+                            if isinstance(stats, dict):
+                                alpha_val = stats.get("alpha", float("nan"))
+                            else:
+                                alpha_val = stats
+                            if isinstance(alpha_val, (int, float)) and math.isfinite(alpha_val):
+                                alpha_sum += float(alpha_val)
+                                count += 1
+                    
+                    if count > 0:
+                        expert_alpha_values[expert_idx] = alpha_sum / count
+                    else:
+                        expert_alpha_values[expert_idx] = 0.0
+                
+                # Sort experts by alpha value
+                sorted_experts = sorted(expert_alpha_values.items(), key=lambda x: x[1])
+                total_experts = num_experts
+                n_high_bit = int(total_experts * args.high_bit_experts_ratio)
+                n_low_bit = int(total_experts * args.low_bit_experts_ratio)
+                
+                # Determine bit assignments
+                high_bit_expert_indices = [sorted_experts[j][0] for j in range(n_high_bit)]
+                low_bit_expert_indices = [sorted_experts[total_experts - j - 1][0] for j in range(n_low_bit)]
+                
+                for expert_idx in range(num_experts):
+                    if expert_idx in high_bit_expert_indices:
+                        assigned_bit = args.wbits + 1
+                    elif expert_idx in low_bit_expert_indices:
+                        assigned_bit = args.wbits - 1
+                    else:
+                        assigned_bit = args.wbits
+                    # Only track once per expert
+                    bit_assignments.append((i, expert_idx, assigned_bit))
+        
+        # Save bit assignments to CSV before GPTQ loop
+        if bit_assignments:
+            # Group by layer and expert (take average if multiple entries per expert)
+            from collections import defaultdict
+            layer_expert_bits = defaultdict(lambda: defaultdict(list))
+            
+            for layer_idx, expert_id, bit_value in bit_assignments:
+                layer_expert_bits[layer_idx][expert_id].append(bit_value)
+            
+            # Calculate average bit for each layer-expert pair
+            csv_data = []
+            for layer_idx in sorted(layer_expert_bits.keys()):
+                for expert_id in sorted(layer_expert_bits[layer_idx].keys()):
+                    bits = layer_expert_bits[layer_idx][expert_id]
+                    # avg_bit = sum(bits) / len(bits)
+                    csv_data.append({
+                        'layer': layer_idx,
+                        'expert_id': expert_id,
+                        'bit': bits
+                    })
+            
+            # Save to CSV
+            df = pd.DataFrame(csv_data)
+            csv_path = args.save_bit_assignments
+            df.to_csv(csv_path, index=False)
+            logger.info(f"Saved bit assignments to CSV (before GPTQ): {csv_path}")
+            print(f"Saved bit assignments for {len(csv_data)} layer-expert pairs to {csv_path} (before GPTQ)")
     
     for i in range(len(layers)):
 
@@ -397,6 +714,9 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
         elif args.mixed_type == "no_calib_auto_programming":
             # Global MILP has already been solved, no per-layer processing needed
             pass
+        elif args.mixed_type == "no_calib_auto_programming_expert_level":
+            # Expert-level MILP has already been solved, no per-layer processing needed
+            pass
 
 
         for names in sequential:
@@ -430,15 +750,7 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
                     gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack) 
                     gptq[name].wbits = assigned_bit
                     
-                    # Track bit assignment for CSV export
-                    if name in expert_modules:
-                        # Extract expert_id from name (e.g., "mlp.experts.0.gate_proj" -> expert_id=0)
-                        name_parts = name.split('.')
-                        if len(name_parts) >= 3 and name_parts[1] == 'experts' and name_parts[2].isdigit():
-                            expert_id = int(name_parts[2])
-                            # Only track once per expert (gate_proj, up_proj, down_proj all have same bit, so we track once)
-                            if name.endswith('.gate_proj'):
-                                bit_assignments.append((i, expert_id, assigned_bit))
+                    # Bit assignments already populated before GPTQ loop for uniform mode, skip tracking here
                 elif args.mixed_type == "no_calib_auto_programming":
                     # Use global MILP-assigned bit-widths
                     # Construct full layer name: model.layers.{i}.{name}
@@ -449,14 +761,31 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
                     gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
                     gptq[name].wbits = assigned_bit
                     
-                    # Track bit assignment for CSV export
-                    if name in expert_modules:
-                        # Extract expert_id from name (e.g., "mlp.experts.0.gate_proj" -> expert_id=0)
+                    # Bit assignments already populated before GPTQ loop, skip tracking here
+                elif args.mixed_type == "no_calib_auto_programming_expert_level":
+                    # Use expert-level MILP-assigned bit-widths
+                    if name not in expert_modules:
+                        # Attention layers: use attn_bits
+                        assigned_bit = args.attn_bits
+                        gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                        gptq[name].wbits = assigned_bit
+                    else:
+                        # Expert layers: extract expert_idx and look up bit-width
+                        # Name format: "mlp.experts.{expert_idx}.gate_proj/up_proj/down_proj"
                         name_parts = name.split('.')
                         if len(name_parts) >= 3 and name_parts[1] == 'experts' and name_parts[2].isdigit():
-                            expert_id = int(name_parts[2])
-                            # Track all weight matrices (gate_proj, up_proj, down_proj) as they may have different bits in MILP mode
-                            bit_assignments.append((i, expert_id, assigned_bit))
+                            expert_idx = int(name_parts[2])
+                            # Look up bit-width from expert assignments
+                            assigned_bit = expert_bit_assignments.get((i, expert_idx), args.wbits)
+                            gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = assigned_bit
+                            
+                            # Bit assignments already populated before GPTQ loop, skip tracking here
+                        else:
+                            # Fallback if we can't parse expert index
+                            assigned_bit = args.wbits
+                            gptq[name].quantizer.configure(assigned_bit, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
+                            gptq[name].wbits = assigned_bit
                 else:
                     if name not in expert_modules:
                         gptq[name].quantizer.configure(args.attn_bits, perchannel=True, sym=args.sym, mse=False, pack=args.pack)
@@ -484,12 +813,14 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
                             gptq[name].wbits = assigned_bit
                         
                         # Track bit assignment for CSV export
-                        # Extract expert_id from name (e.g., "mlp.experts.0.gate_proj" -> expert_id=0)
-                        if expert_prefix:
-                            expert_id = int(name_parts[2])
-                            # Only track once per expert (gate_proj, up_proj, down_proj all have same bit, so we track once)
-                            if name.endswith('.gate_proj'):
-                                bit_assignments.append((i, expert_id, assigned_bit))
+                        # Skip for mixed_with_alpha mode (already populated before GPTQ loop)
+                        if args.mixed_type != "mixed_with_alpha":
+                            # Extract expert_id from name (e.g., "mlp.experts.0.gate_proj" -> expert_id=0)
+                            if expert_prefix:
+                                expert_id = int(name_parts[2])
+                                # Only track once per expert (gate_proj, up_proj, down_proj all have same bit, so we track once)
+                                if name.endswith('.gate_proj'):
+                                    bit_assignments.append((i, expert_id, assigned_bit))
             # print(layer)
             def add_batch(name):
                 def tmp(_, inp, out):
@@ -547,33 +878,39 @@ def deepseek_sequential(model, dataloader, dev, bit_config=None):
 
     model.config.use_cache = use_cache
     
-    # Save bit assignments to CSV if specified
+    # Save bit assignments to CSV if specified (for modes that determine bits during GPTQ loop)
+    # Note: For modes that can determine bits before GPTQ (no_calib_auto_programming, 
+    # no_calib_auto_programming_expert_level, uniform, mixed_with_alpha), 
+    # bit assignments are already saved before the GPTQ loop
     if args.save_bit_assignments and bit_assignments:
-        # Group by layer and expert (take average if multiple entries per expert)
-        from collections import defaultdict
-        layer_expert_bits = defaultdict(lambda: defaultdict(list))
-        
-        for layer_idx, expert_id, bit_value in bit_assignments:
-            layer_expert_bits[layer_idx][expert_id].append(bit_value)
-        
-        # Calculate average bit for each layer-expert pair
-        csv_data = []
-        for layer_idx in sorted(layer_expert_bits.keys()):
-            for expert_id in sorted(layer_expert_bits[layer_idx].keys()):
-                bits = layer_expert_bits[layer_idx][expert_id]
-                avg_bit = sum(bits) / len(bits)
-                csv_data.append({
-                    'layer': layer_idx,
-                    'expert_id': expert_id,
-                    'bit': round(avg_bit, 2)
-                })
-        
-        # Save to CSV
-        df = pd.DataFrame(csv_data)
-        csv_path = args.save_bit_assignments
-        df.to_csv(csv_path, index=False)
-        logger.info(f"Saved bit assignments to CSV: {csv_path}")
-        print(f"Saved bit assignments for {len(csv_data)} layer-expert pairs to {csv_path}")
+        # Check if already saved before GPTQ loop
+        modes_saved_before = ["no_calib_auto_programming", "no_calib_auto_programming_expert_level", "uniform", "mixed_with_alpha"]
+        if args.mixed_type not in modes_saved_before:
+            # Group by layer and expert (take average if multiple entries per expert)
+            from collections import defaultdict
+            layer_expert_bits = defaultdict(lambda: defaultdict(list))
+            
+            for layer_idx, expert_id, bit_value in bit_assignments:
+                layer_expert_bits[layer_idx][expert_id].append(bit_value)
+            
+            # Calculate average bit for each layer-expert pair
+            csv_data = []
+            for layer_idx in sorted(layer_expert_bits.keys()):
+                for expert_id in sorted(layer_expert_bits[layer_idx].keys()):
+                    bits = layer_expert_bits[layer_idx][expert_id]
+                    # avg_bit = sum(bits) / len(bits)
+                    csv_data.append({
+                        'layer': layer_idx,
+                        'expert_id': expert_id,
+                        'bit': bits
+                    })
+            
+            # Save to CSV
+            df = pd.DataFrame(csv_data)
+            csv_path = args.save_bit_assignments
+            df.to_csv(csv_path, index=False)
+            logger.info(f"Saved bit assignments to CSV: {csv_path}")
+            print(f"Saved bit assignments for {len(csv_data)} layer-expert pairs to {csv_path}")
 
     return quantizers
 
@@ -692,7 +1029,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mixed_type",
         type=str,
-        choices=["uniform", "mixed", "random", "manual", "mixed_with_alpha", "no_calib_auto_programming"],
+        choices=["uniform", "mixed", "random", "manual", "mixed_with_alpha", "no_calib_auto_programming", "no_calib_auto_programming_expert_level"],
         help='Whether to use mixed-precision',
     )
     parser.add_argument(
@@ -807,6 +1144,9 @@ if __name__ == "__main__":
             saving_path = args.saving_path + f"-atten_{args.attn_bits}-e_{avg_bit_ratio:.2f}"
         elif args.mixed_type == "no_calib_auto_programming":
             # For MILP, use the budget as the average bits
+            saving_path = args.saving_path + f"-atten_{args.attn_bits}-e_{args.milp_bpp_budget:.2f}"
+        elif args.mixed_type == "no_calib_auto_programming_expert_level":
+            # For expert-level MILP, use the budget as the average bits
             saving_path = args.saving_path + f"-atten_{args.attn_bits}-e_{args.milp_bpp_budget:.2f}"
         else:
             # For uniform or other modes, use wbits directly
