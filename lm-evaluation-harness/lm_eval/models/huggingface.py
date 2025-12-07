@@ -1771,12 +1771,12 @@ class HFLM(TemplateLM):
                 use_cache=False,
             )
         scores = self.reroute_manager.get_scores()
-            weights = compute_layer_weights(
-                scores=scores,
-                topk=self.reroute_manager.top_k or 2,
-                start_layer=self.reroute_config["layer_start"],
-            )
-            self.reroute_manager.set_weights(weights)
+        weights = compute_layer_weights(
+            scores=scores,
+            topk=self.reroute_manager.top_k or 2,
+            start_layer=self.reroute_config["layer_start"],
+        )
+        self.reroute_manager.set_weights(weights)
         if self.reroute_config.get("log") and weights:
             top_items = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:5]
             summary = ", ".join(f"L{idx}:{w:.3f}" for idx, w in top_items)
