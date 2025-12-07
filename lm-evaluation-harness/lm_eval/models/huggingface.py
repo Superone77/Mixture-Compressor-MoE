@@ -30,7 +30,11 @@ from transformers.models.auto.modeling_auto import (
 from lm_eval import utils
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from lm_eval.models.moe_rerouting import MixtralRerouter, compute_layer_weights
+from lm_eval.models.moe_rerouting import (
+    MixtralRerouter,
+    OlmoeRerouter,
+    compute_layer_weights,
+)
 from lm_eval.models.utils import (
     Collator,
     _add_special_kwargs,
@@ -343,43 +347,50 @@ class HFLM(TemplateLM):
             self._rank = 0
             self._world_size = 1
 
-        self.reroute_manager: MixtralRerouter | None = None
+        self.reroute_manager: MixtralRerouter | OlmoeRerouter | None = None
         self.reroute_config: dict[str, Any] | None = None
         if reroute_moe:
-            try:
-                from transformers import MixtralForCausalLM
-            except Exception as err:  # pragma: no cover - optional dependency
-                eval_logger.warning(
-                    "Rerouting requested but Mixtral dependencies are unavailable: %s",
-                    err,
-                )
+            model_type = getattr(self.model.config, "model_type", None)
+            if model_type == "olmoe":
+                self.reroute_manager = OlmoeRerouter(self.model)
             else:
-                if isinstance(self.model, MixtralForCausalLM):
-                    self.reroute_manager = MixtralRerouter(self.model)
-                    if self.reroute_manager.has_blocks:
-                        self.reroute_config = {
-                            "steps": int(reroute_steps),
-                            "lr": float(reroute_lr),
-                            "chunk_size": int(reroute_chunk_size),
-                            "layer_start": int(reroute_layer_start),
-                            "log": bool(reroute_log),
-                        }
-                        eval_logger.info(
-                            "Enabled Mixtral test-time rerouting (steps=%s, lr=%s, chunk_size=%s, start_layer=%s)",
-                            self.reroute_config["steps"],
-                            self.reroute_config["lr"],
-                            self.reroute_config["chunk_size"],
-                            self.reroute_config["layer_start"],
-                        )
+                try:
+                    from transformers import MixtralForCausalLM
+                except Exception as err:  # pragma: no cover - optional dependency
+                    eval_logger.warning(
+                        "Rerouting requested but Mixtral dependencies are unavailable: %s",
+                        err,
+                    )
+                else:
+                    if isinstance(self.model, MixtralForCausalLM):
+                        self.reroute_manager = MixtralRerouter(self.model)
                     else:
                         eval_logger.warning(
-                            "Rerouting requested but no Mixtral MoE blocks were detected."
+                            "Rerouting requested but model is not Mixtral/OLMoE. Ignoring rerouting flag."
                         )
-                        self.reroute_manager = None
-                else:
-                    eval_logger.warning(
-                        "Rerouting requested but model is not Mixtral. Ignoring rerouting flag."
-                    )
+
+            if self.reroute_manager and self.reroute_manager.has_blocks:
+                self.reroute_config = {
+                    "steps": int(reroute_steps),
+                    "lr": float(reroute_lr),
+                    "chunk_size": int(reroute_chunk_size),
+                    "layer_start": int(reroute_layer_start),
+                    "log": bool(reroute_log),
+                }
+                eval_logger.info(
+                    "Enabled MoE test-time rerouting (steps=%s, lr=%s, chunk_size=%s, start_layer=%s, model_type=%s)",
+                    self.reroute_config["steps"],
+                    self.reroute_config["lr"],
+                    self.reroute_config["chunk_size"],
+                    self.reroute_config["layer_start"],
+                    model_type,
+                )
+            elif self.reroute_manager:
+                eval_logger.warning(
+                    "Rerouting requested but no MoE blocks were detected for model_type=%s.",
+                    model_type,
+                )
+                self.reroute_manager = None
 
         self.custom_prefix_token_id = prefix_token_id
         if prefix_token_id is not None:
