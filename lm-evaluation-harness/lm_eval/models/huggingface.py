@@ -112,6 +112,7 @@ class HFLM(TemplateLM):
         reroute_lr: float = 5e-3,
         reroute_chunk_size: int = 50,
         reroute_layer_start: int = 0,
+        reroute_log: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -361,6 +362,7 @@ class HFLM(TemplateLM):
                             "lr": float(reroute_lr),
                             "chunk_size": int(reroute_chunk_size),
                             "layer_start": int(reroute_layer_start),
+                            "log": bool(reroute_log),
                         }
                         eval_logger.info(
                             "Enabled Mixtral test-time rerouting (steps=%s, lr=%s, chunk_size=%s, start_layer=%s)",
@@ -672,7 +674,7 @@ class HFLM(TemplateLM):
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
-                dtype=get_dtype(dtype),
+                torch_dtype=get_dtype(dtype),
                 trust_remote_code=trust_remote_code,
                 gguf_file=gguf_file,
                 quantization_config=quantization_config,
@@ -756,7 +758,7 @@ class HFLM(TemplateLM):
             _model_delta = self.AUTO_MODEL_CLASS.from_pretrained(
                 delta,
                 revision=revision,
-                dtype=get_dtype(dtype),
+                torch_dtype=get_dtype(dtype),
                 trust_remote_code=trust_remote_code,
                 **model_kwargs,
             )
@@ -1704,6 +1706,17 @@ class HFLM(TemplateLM):
                     loss.backward()
                     optimizer.step()
                 self.model.eval()
+                if config["log"]:
+                    delta_norm = sum(
+                        p.data.norm().item()
+                        for p in manager.get_delta_parameters()
+                        if p.requires_grad
+                    )
+                    eval_logger.info(
+                        "[reroute] Optimized deltas (norm=%.4f) on context len=%d",
+                        delta_norm,
+                        current_ids.shape[1],
+                    )
 
             gen_tokens = min(config["chunk_size"], max_gen_toks - total_generated)
             stopping_criteria = stop_sequences_criteria(
@@ -1758,12 +1771,16 @@ class HFLM(TemplateLM):
                 use_cache=False,
             )
         scores = self.reroute_manager.get_scores()
-        weights = compute_layer_weights(
-            scores=scores,
-            topk=self.reroute_manager.top_k or 2,
-            start_layer=self.reroute_config["layer_start"],
-        )
-        self.reroute_manager.set_weights(weights)
+            weights = compute_layer_weights(
+                scores=scores,
+                topk=self.reroute_manager.top_k or 2,
+                start_layer=self.reroute_config["layer_start"],
+            )
+            self.reroute_manager.set_weights(weights)
+        if self.reroute_config.get("log") and weights:
+            top_items = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            summary = ", ".join(f"L{idx}:{w:.3f}" for idx, w in top_items)
+            eval_logger.info("[reroute] Layer weights (top 5): %s", summary)
 
     def apply_chat_template(
         self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True

@@ -25,6 +25,7 @@ def build_model_args(args: argparse.Namespace) -> str:
         "reroute_lr": args.reroute_lr,
         "reroute_chunk_size": args.reroute_chunk_size,
         "reroute_layer_start": args.reroute_layer_start,
+        "reroute_log": args.reroute_log,
         "dtype": args.dtype,
         "device_map": args.device_map,
         "use_fast_tokenizer": args.use_fast_tokenizer,
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reroute_lr", type=float, default=5e-3)
     parser.add_argument("--reroute_chunk_size", type=int, default=64)
     parser.add_argument("--reroute_layer_start", type=int, default=0)
+    parser.add_argument(
+        "--reroute_log",
+        action="store_true",
+        help="Enable verbose rerouter logging (layer weights, delta norms).",
+    )
 
     parser.add_argument(
         "--harness_path",
