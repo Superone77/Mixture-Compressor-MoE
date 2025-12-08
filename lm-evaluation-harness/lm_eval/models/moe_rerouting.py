@@ -97,7 +97,6 @@ class MixtralRerouter:
                 ).detach().cpu()
                 return logits
 
-            block.gate._reroute_parent = block  # type: ignore[attr-defined]
             block._reroute_hook = block.gate.register_forward_hook(_gate_hook)
             self.blocks.append((layer_idx, block))
             if self.top_k is None:
@@ -195,7 +194,6 @@ class OlmoeRerouter:
                 ).detach().cpu()
                 return logits
 
-            block.gate._reroute_parent = block  # type: ignore[attr-defined]
             block._reroute_hook = block.gate.register_forward_hook(_gate_hook)
             self.blocks.append((layer_idx, block))
             if self.top_k is None:
