@@ -1842,7 +1842,7 @@ class HFLM(TemplateLM):
             )
         scores = self.reroute_manager.get_scores()
         weights = compute_layer_weights(
-            scores=scores,
+            score_dict=scores,
             topk=self.reroute_manager.top_k or 2,
             start_layer=self.reroute_config["layer_start"],
         )
