@@ -1698,6 +1698,8 @@ class HFLM(TemplateLM):
 
         for param in self.model.parameters():
             param.requires_grad = False
+        for p in delta_params:
+            p.requires_grad = True
 
         optimizer = torch.optim.AdamW(
             delta_params, lr=config["lr"], weight_decay=1e-5
@@ -1797,6 +1799,8 @@ class HFLM(TemplateLM):
 
         for param in self.model.parameters():
             param.requires_grad = False
+        for p in delta_params:
+            p.requires_grad = True
 
         optimizer = torch.optim.AdamW(delta_params, lr=config["lr"], weight_decay=1e-5)
 
