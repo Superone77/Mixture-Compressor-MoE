@@ -1349,6 +1349,15 @@ class HFLM(TemplateLM):
                     "labels": batched_conts,
                 }
 
+            # Optional: apply rerouting optimization for loglikelihood batches (causal only)
+            if (
+                self.reroute_manager is not None
+                and self.backend == "causal"
+                and batched_inps.numel() > 0
+            ):
+                attn_mask = torch.ones_like(batched_inps, device=batched_inps.device)
+                self._apply_reroute_on_batch(batched_inps, attn_mask)
+
             multi_logits = F.log_softmax(
                 self._model_call(batched_inps, **call_kwargs),
                 dim=-1,
@@ -1768,6 +1777,56 @@ class HFLM(TemplateLM):
 
         self.model.eval()
         return current_ids
+
+    def _apply_reroute_on_batch(
+        self, input_ids: torch.Tensor, attn_mask: torch.Tensor
+    ) -> None:
+        if self.reroute_manager is None or self.reroute_config is None:
+            return
+
+        manager = self.reroute_manager
+        config = self.reroute_config
+        manager.reset()
+
+        target_layers = [idx for idx, _ in manager.blocks if idx >= config["layer_start"]]
+        manager.enable(target_layers)
+
+        delta_params = manager.get_delta_parameters()
+        if not delta_params:
+            return
+
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        optimizer = torch.optim.AdamW(delta_params, lr=config["lr"], weight_decay=1e-5)
+
+        # Update routing weights using current batch
+        self._update_rerouting_weights(input_ids=input_ids, attn_mask=attn_mask)
+
+        if config["steps"] > 0:
+            self.model.train()
+            for _ in range(config["steps"]):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    labels=input_ids,
+                )
+                loss = outputs.loss
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            self.model.eval()
+            if config["log"]:
+                delta_norm = sum(
+                    p.data.norm().item()
+                    for p in manager.get_delta_parameters()
+                    if p.requires_grad
+                )
+                eval_logger.info(
+                    "[reroute-ppl] Optimized deltas (norm=%.4f) on batch len=%d",
+                    delta_norm,
+                    input_ids.shape[1],
+                )
 
     def _update_rerouting_weights(
         self, input_ids: torch.Tensor, attn_mask: torch.Tensor
