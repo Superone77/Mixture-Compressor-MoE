@@ -776,17 +776,6 @@ if __name__ == "__main__":
     quantizers = olmoe_sequential(model, dataloader, device, bit_config)
     print("quantization time:", time.time() - tick, "s")
     print(model)
-
-    if args.eval_ppl:
-        for dataset in ["wikitext2"]:#, "c4", "ptb"]:
-            dataloader, testloader = get_loaders(
-                dataset, seed=args.seed, seqlen=2048, model=args.model
-            )
-            print(dataset)
-            from eval_ppl_utils import llama_eval
-            t1 = time.time()
-            llama_eval(model, testloader, device, dataset)
-            print("Time: ", time.time() - t1)
     if args.save:
         # Calculate average bits for different mixed_type modes
         if args.mixed_type in ["manual", "mixed"] and args.precisions:
@@ -811,4 +800,15 @@ if __name__ == "__main__":
         tokenizer.save_pretrained(saving_path)
         from utils.pack import save_quantized
         save_quantized(model, saving_path)
+    if args.eval_ppl:
+        for dataset in ["wikitext2"]:#, "c4", "ptb"]:
+            dataloader, testloader = get_loaders(
+                dataset, seed=args.seed, seqlen=2048, model=args.model
+            )
+            print(dataset)
+            from eval_ppl_utils import llama_eval
+            t1 = time.time()
+            llama_eval(model, testloader, device, dataset)
+            print("Time: ", time.time() - t1)
+    
 

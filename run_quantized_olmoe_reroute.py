@@ -20,7 +20,7 @@ from typing import Any, Dict
 import torch
 from transformers import AutoTokenizer
 
-from inference import load_quantized_model
+from inference_olmoe import load_quantized_model
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,7 +140,7 @@ def main() -> None:
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         device=args.device,
-        reroute_moe=True,
+        reroute_moe=False,
         reroute_steps=args.reroute_steps,
         reroute_lr=args.reroute_lr,
         reroute_chunk_size=args.reroute_chunk_size,
