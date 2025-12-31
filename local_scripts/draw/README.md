@@ -1,4 +1,4 @@
-# Experiment Scripts for MoE Quantization Analysis
+# Experiment Scripts for MoE Calibration Analysis
 
 This directory contains scripts for running experiments described in `experiment_0.md`.
 
@@ -13,20 +13,19 @@ This directory contains scripts for running experiments described in `experiment
 **Usage**:
 ```bash
 python local_scripts/draw/experiment_1_1_expert_activation.py \
-    --model mistralai/Mixtral-8x7B-v0.1 \
-    --output experiment_1_1_activation_rates.csv \
-    --device cuda:0 \
+    --model deepseek-ai/DeepSeek-V2-Lite \
+    --output_csv experiment_1_1_expert_activation.csv \
     --nsamples 128 \
-    --seed 0
+    --seed 0 \
+    --seqlen 2048 \
+    --device cuda
 ```
 
 **Output**: CSV file with columns:
+- `dataset`: Dataset name (wikitext2, gsm8k)
 - `layer`: Layer index
-- `expert_id`: Expert ID (0-7)
-- `dataset`: Dataset name (wikitext2 or gsm8k)
-- `activation_rate`: Activation rate (0.0-1.0)
-- `activation_count`: Number of activations
-- `total_tokens`: Total tokens processed
+- `expert_id`: Expert ID (0-63)
+- `utilization_rate`: Expert utilization rate (%)
 
 ### Experiment 1.2: Cross-Domain Performance Drop
 
@@ -36,25 +35,33 @@ python local_scripts/draw/experiment_1_1_expert_activation.py \
 
 **Usage**:
 ```bash
+# First run: Quantize and evaluate (this will take a while)
 python local_scripts/draw/experiment_1_2_cross_domain.py \
-    --model mistralai/Mixtral-8x7B-v0.1 \
-    --output experiment_1_2_perplexity.csv \
-    --device cuda:0 \
+    --model deepseek-ai/DeepSeek-V2-Lite \
+    --output_csv experiment_1_2_cross_domain.csv \
+    --model_cache_dir ./quantized_models \
     --nsamples 128 \
+    --seed 0 \
+    --seqlen 2048 \
     --wbits 4bit \
     --attn_bits 4bit \
     --mixed_type uniform \
-    --sym \
-    --pack
+    --device cuda
+
+# If models are already quantized, skip quantization:
+python local_scripts/draw/experiment_1_2_cross_domain.py \
+    --model deepseek-ai/DeepSeek-V2-Lite \
+    --output_csv experiment_1_2_cross_domain.csv \
+    --model_cache_dir ./quantized_models \
+    --skip_quantization \
+    --device cuda
 ```
 
 **Output**: CSV file with columns:
 - `model`: Model name (Model_Wiki or Model_GSM)
-- `calibration_dataset`: Dataset used for calibration
-- `test_dataset`: Dataset used for testing
+- `calibration_dataset`: Dataset used for calibration (wikitext2 or gsm8k)
+- `test_dataset`: Dataset used for evaluation (wikitext2 or gsm8k)
 - `perplexity`: Perplexity score
-
-**Note**: This experiment requires quantizing the model twice (once with WikiText2, once with GSM8K), which can be time-consuming. You can use `--skip_quantization` with `--model_wiki_path` and `--model_gsm_path` to load pre-quantized models.
 
 ## Visualization
 
@@ -65,44 +72,47 @@ python local_scripts/draw/experiment_1_2_cross_domain.py \
 # Visualize both experiments
 python local_scripts/draw/visualize_experiments.py \
     --experiment both \
-    --csv_1_1 experiment_1_1_activation_rates.csv \
-    --csv_1_2 experiment_1_2_perplexity.csv
+    --csv_1_1 experiment_1_1_expert_activation.csv \
+    --csv_1_2 experiment_1_2_cross_domain.csv \
+    --output_dir ./figures
 
 # Visualize only Experiment 1.1
 python local_scripts/draw/visualize_experiments.py \
     --experiment 1.1 \
-    --csv_1_1 experiment_1_1_activation_rates.csv
+    --csv_1_1 experiment_1_1_expert_activation.csv \
+    --output_dir ./figures
 
 # Visualize only Experiment 1.2
 python local_scripts/draw/visualize_experiments.py \
     --experiment 1.2 \
-    --csv_1_2 experiment_1_2_perplexity.csv
+    --csv_1_2 experiment_1_2_cross_domain.csv \
+    --output_dir ./figures
 ```
 
-**Output**: 
-- `experiment_1_1_heatmap.png`: Heatmap showing expert activation rates per layer
-- `experiment_1_1_bar.png`: Bar chart showing average activation rate per layer
-- `experiment_1_2_performance.png`: Grouped bar chart showing perplexity comparison
+**Output**:
+- `experiment_1_1_heatmap.png`: Heatmap showing expert utilization rates by layer
+- `experiment_1_1_bar_chart.png`: Bar chart showing average utilization and zero-activation experts per layer
+- `experiment_1_2_bar_chart.png`: Grouped bar chart comparing model performance across test datasets
+- `experiment_1_2_heatmap.png`: Heatmap showing performance matrix
 
 ## Dependencies
 
+Make sure you have the following packages installed:
 - torch
 - transformers
 - pandas
 - matplotlib
 - seaborn
 - tqdm
-- datasets
+- datasets (for data loading)
 
 ## Notes
 
-1. **Memory Requirements**: These experiments require significant GPU memory. For Mixtral-8x7B, you'll need at least 24GB GPU memory.
+1. **Experiment 1.1** requires running inference on the model, which may take some time depending on the number of samples and model size.
 
-2. **Time Requirements**: 
-   - Experiment 1.1: ~30-60 minutes depending on number of samples
-   - Experiment 1.2: ~2-4 hours (requires quantizing model twice)
+2. **Experiment 1.2** requires quantizing the model twice (once with WikiText2, once with GSM8K), which can take a significant amount of time. The quantized models are cached in `--model_cache_dir` so you can skip quantization on subsequent runs using `--skip_quantization`.
 
-3. **Data**: The scripts use the `datautils.py` module to load datasets. Make sure you have internet connection for first-time dataset downloads.
+3. Both experiments output CSV files that can be analyzed separately or visualized using the visualization script.
 
-4. **Model Loading**: For Experiment 1.2, if you want to skip quantization and use pre-quantized models, you need to save them first using `main.py` with `--save` flag.
+4. The visualization script creates publication-ready figures with proper styling and labels.
 

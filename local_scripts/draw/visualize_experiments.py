@@ -2,8 +2,9 @@
 """
 Visualization script for Experiment 1.1 and 1.2
 
-- Experiment 1.1: Expert Activation Heatmaps
-- Experiment 1.2: Cross-Domain Performance Drop (Grouped Bar Chart)
+This script creates visualizations from the CSV outputs:
+- Experiment 1.1: Expert activation heatmaps
+- Experiment 1.2: Cross-domain performance bar charts
 """
 
 import pandas as pd
@@ -13,195 +14,267 @@ import argparse
 import numpy as np
 from pathlib import Path
 
+# Set style
+sns.set_style("whitegrid")
+plt.rcParams['figure.dpi'] = 150
+plt.rcParams['savefig.dpi'] = 300
+plt.rcParams['font.size'] = 10
 
-def plot_experiment_1_1(csv_path, output_path=None):
-    """Plot expert activation heatmap for Experiment 1.1."""
+
+def visualize_experiment_1_1(csv_path: str, output_path: str = None):
+    """Visualize Experiment 1.1: Expert Activation Heatmaps."""
     print(f"Loading data from {csv_path}...")
     df = pd.read_csv(csv_path)
     
-    # Create pivot table: layer x expert_id, with dataset as separate columns
+    # Create figure with subplots
     datasets = df['dataset'].unique()
+    n_datasets = len(datasets)
     
-    fig, axes = plt.subplots(1, len(datasets), figsize=(12 * len(datasets), 8))
-    if len(datasets) == 1:
+    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 8))
+    if n_datasets == 1:
         axes = [axes]
     
     for idx, dataset in enumerate(datasets):
-        df_dataset = df[df['dataset'] == dataset]
-        pivot = df_dataset.pivot_table(
-            values='activation_rate',
+        ax = axes[idx]
+        dataset_df = df[df['dataset'] == dataset]
+        
+        # Pivot to create heatmap: layers x experts
+        pivot_df = dataset_df.pivot_table(
             index='layer',
             columns='expert_id',
-            aggfunc='mean'
+            values='utilization_rate',
+            fill_value=0.0
         )
-        
-        # Sort by layer
-        pivot = pivot.sort_index()
         
         # Create heatmap
         sns.heatmap(
-            pivot,
-            annot=False,
-            fmt='.2f',
+            pivot_df,
+            ax=ax,
             cmap='YlOrRd',
-            cbar_kws={'label': 'Activation Rate'},
-            ax=axes[idx],
+            cbar_kws={'label': 'Utilization Rate (%)'},
             vmin=0,
-            vmax=1.0
+            vmax=100,
+            fmt='.1f',
+            annot=False,  # Set to True if you want numbers on cells
+            linewidths=0.5,
+            linecolor='gray'
         )
         
-        axes[idx].set_title(f'Expert Activation Rate - {dataset.upper()}', fontsize=14, fontweight='bold')
-        axes[idx].set_xlabel('Expert ID', fontsize=12)
-        axes[idx].set_ylabel('Layer', fontsize=12)
-        axes[idx].invert_yaxis()  # Layer 0 at top
+        ax.set_title(f'Expert Utilization Rate by Layer\n{dataset.upper()}', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Expert ID', fontsize=12)
+        ax.set_ylabel('Layer Index', fontsize=12)
+        ax.invert_yaxis()  # Layer 0 at top
     
     plt.tight_layout()
     
     if output_path:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.savefig(output_path, bbox_inches='tight')
         print(f"Saved heatmap to {output_path}")
     else:
-        plt.savefig('experiment_1_1_heatmap.png', dpi=300, bbox_inches='tight')
+        plt.savefig('experiment_1_1_heatmap.png', bbox_inches='tight')
         print("Saved heatmap to experiment_1_1_heatmap.png")
     
     plt.close()
     
-    # Also create a bar chart showing average activation rate per layer
-    fig, ax = plt.subplots(figsize=(14, 6))
+    # Also create a bar chart showing average utilization per layer
+    fig, axes = plt.subplots(1, n_datasets, figsize=(12 * n_datasets, 6))
+    if n_datasets == 1:
+        axes = [axes]
     
-    layer_avg = df.groupby(['layer', 'dataset'])['activation_rate'].mean().reset_index()
-    
-    x = np.arange(len(layer_avg['layer'].unique()))
-    width = 0.35
-    
-    for i, dataset in enumerate(datasets):
-        dataset_data = layer_avg[layer_avg['dataset'] == dataset]
-        layers = dataset_data['layer'].values
-        rates = dataset_data['activation_rate'].values
-        ax.bar(x + i * width, rates, width, label=dataset.upper(), alpha=0.8)
-    
-    ax.set_xlabel('Layer', fontsize=12)
-    ax.set_ylabel('Average Activation Rate', fontsize=12)
-    ax.set_title('Average Expert Activation Rate per Layer', fontsize=14, fontweight='bold')
-    ax.set_xticks(x + width / 2)
-    ax.set_xticklabels(layer_avg['layer'].unique(), rotation=45, ha='right')
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
+    for idx, dataset in enumerate(datasets):
+        ax = axes[idx]
+        dataset_df = df[df['dataset'] == dataset]
+        
+        # Calculate average utilization per layer
+        layer_avg = dataset_df.groupby('layer')['utilization_rate'].mean().reset_index()
+        
+        # Calculate number of experts with 0% activation per layer
+        layer_zero = dataset_df.groupby('layer').apply(
+            lambda x: (x['utilization_rate'] == 0).sum()
+        ).reset_index(name='zero_experts')
+        
+        # Create bar chart
+        x = layer_avg['layer']
+        width = 0.35
+        
+        ax2 = ax.twinx()
+        bars1 = ax.bar(x - width/2, layer_avg['utilization_rate'], width, 
+                      label='Avg Utilization Rate (%)', color='steelblue', alpha=0.7)
+        bars2 = ax2.bar(x + width/2, layer_zero['zero_experts'], width,
+                       label='Experts with 0% Activation', color='coral', alpha=0.7)
+        
+        ax.set_xlabel('Layer Index', fontsize=12)
+        ax.set_ylabel('Average Utilization Rate (%)', fontsize=12, color='steelblue')
+        ax2.set_ylabel('Number of Experts with 0% Activation', fontsize=12, color='coral')
+        ax.set_title(f'Expert Utilization Summary by Layer\n{dataset.upper()}', 
+                    fontsize=14, fontweight='bold')
+        
+        # Add legend
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        
+        ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
-    bar_output = output_path.replace('.png', '_bar.png') if output_path else 'experiment_1_1_bar.png'
-    plt.savefig(bar_output, dpi=300, bbox_inches='tight')
-    print(f"Saved bar chart to {bar_output}")
+    if output_path:
+        bar_path = output_path.replace('.png', '_bar_chart.png')
+        plt.savefig(bar_path, bbox_inches='tight')
+        print(f"Saved bar chart to {bar_path}")
+    else:
+        plt.savefig('experiment_1_1_bar_chart.png', bbox_inches='tight')
+        print("Saved bar chart to experiment_1_1_bar_chart.png")
+    
     plt.close()
 
 
-def plot_experiment_1_2(csv_path, output_path=None):
-    """Plot grouped bar chart for Experiment 1.2."""
+def visualize_experiment_1_2(csv_path: str, output_path: str = None):
+    """Visualize Experiment 1.2: Cross-Domain Performance Drop."""
     print(f"Loading data from {csv_path}...")
     df = pd.read_csv(csv_path)
     
     # Create grouped bar chart
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Prepare data
-    models = df['model'].unique()
+    # Prepare data for grouped bar chart
     test_datasets = df['test_dataset'].unique()
+    models = df['model'].unique()
     
     x = np.arange(len(test_datasets))
     width = 0.35
     
-    colors = ['#1f77b4', '#ff7f0e']  # Blue and orange
-    
+    # Create bars for each model
     for i, model in enumerate(models):
         model_data = df[df['model'] == model]
-        perplexities = []
-        for test_ds in test_datasets:
-            ppl = model_data[model_data['test_dataset'] == test_ds]['perplexity'].values
-            perplexities.append(ppl[0] if len(ppl) > 0 else 0)
+        perplexities = [model_data[model_data['test_dataset'] == ds]['perplexity'].values[0] 
+                        for ds in test_datasets]
         
-        bars = ax.bar(x + i * width, perplexities, width, label=model, alpha=0.8, color=colors[i])
+        offset = (i - len(models)/2 + 0.5) * width
+        bars = ax.bar(x + offset, perplexities, width, label=model, alpha=0.8)
         
         # Add value labels on bars
         for bar in bars:
             height = bar.get_height()
             ax.text(bar.get_x() + bar.get_width()/2., height,
                    f'{height:.2f}',
-                   ha='center', va='bottom', fontsize=10)
+                   ha='center', va='bottom', fontsize=9)
     
     ax.set_xlabel('Test Dataset', fontsize=12)
     ax.set_ylabel('Perplexity (PPL)', fontsize=12)
-    ax.set_title('Cross-Domain Performance Drop\n(Calibration Domain vs Test Domain)', 
-                 fontsize=14, fontweight='bold')
-    ax.set_xticks(x + width / 2)
-    ax.set_xticklabels([ds.upper() for ds in test_datasets])
+    ax.set_title('Cross-Domain Performance: Model vs Test Dataset', 
+                fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(test_datasets)
     ax.legend()
-    ax.grid(axis='y', alpha=0.3)
+    ax.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
     
     if output_path:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"Saved chart to {output_path}")
+        plt.savefig(output_path, bbox_inches='tight')
+        print(f"Saved bar chart to {output_path}")
     else:
-        plt.savefig('experiment_1_2_performance.png', dpi=300, bbox_inches='tight')
-        print("Saved chart to experiment_1_2_performance.png")
+        plt.savefig('experiment_1_2_bar_chart.png', bbox_inches='tight')
+        print("Saved bar chart to experiment_1_2_bar_chart.png")
     
     plt.close()
     
-    # Print summary statistics
-    print("\n" + "="*80)
-    print("Summary Statistics:")
-    print("="*80)
-    for model in models:
-        print(f"\n{model}:")
-        model_data = df[df['model'] == model]
-        for test_ds in test_datasets:
-            ppl = model_data[model_data['test_dataset'] == test_ds]['perplexity'].values
-            if len(ppl) > 0:
-                calib_ds = model_data[model_data['test_dataset'] == test_ds]['calibration_dataset'].values[0]
-                print(f"  {test_ds.upper()}: {ppl[0]:.4f} (calibrated on {calib_ds})")
+    # Also create a heatmap showing the performance matrix
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Create pivot table: models x test_datasets
+    pivot_df = df.pivot_table(
+        index='model',
+        columns='test_dataset',
+        values='perplexity',
+        fill_value=0.0
+    )
+    
+    sns.heatmap(
+        pivot_df,
+        ax=ax,
+        cmap='RdYlGn_r',  # Reversed: lower perplexity (better) = darker green
+        cbar_kws={'label': 'Perplexity (PPL)'},
+        annot=True,
+        fmt='.2f',
+        linewidths=0.5,
+        linecolor='gray',
+        square=True
+    )
+    
+    ax.set_title('Cross-Domain Performance Heatmap\n(Lower is Better)', 
+                fontsize=14, fontweight='bold')
+    ax.set_xlabel('Test Dataset', fontsize=12)
+    ax.set_ylabel('Model (Calibration Dataset)', fontsize=12)
+    
+    plt.tight_layout()
+    
+    if output_path:
+        heatmap_path = output_path.replace('.png', '_heatmap.png')
+        plt.savefig(heatmap_path, bbox_inches='tight')
+        print(f"Saved heatmap to {heatmap_path}")
+    else:
+        plt.savefig('experiment_1_2_heatmap.png', bbox_inches='tight')
+        print("Saved heatmap to experiment_1_2_heatmap.png")
+    
+    plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize experiment results")
-    parser.add_argument('--experiment', type=str, choices=['1.1', '1.2', 'both'], default='both',
-                       help='Which experiment to visualize')
-    parser.add_argument('--csv_1_1', type=str, default='experiment_1_1_activation_rates.csv',
-                       help='CSV file for Experiment 1.1')
-    parser.add_argument('--csv_1_2', type=str, default='experiment_1_2_perplexity.csv',
-                       help='CSV file for Experiment 1.2')
-    parser.add_argument('--output_1_1', type=str, default=None,
-                       help='Output path for Experiment 1.1 visualization')
-    parser.add_argument('--output_1_2', type=str, default=None,
-                       help='Output path for Experiment 1.2 visualization')
+    parser = argparse.ArgumentParser(
+        description="Visualize Experiment 1.1 and 1.2 results"
+    )
+    parser.add_argument(
+        '--experiment',
+        type=str,
+        choices=['1.1', '1.2', 'both'],
+        default='both',
+        help='Which experiment to visualize'
+    )
+    parser.add_argument(
+        '--csv_1_1',
+        type=str,
+        default='experiment_1_1_expert_activation.csv',
+        help='CSV file for Experiment 1.1'
+    )
+    parser.add_argument(
+        '--csv_1_2',
+        type=str,
+        default='experiment_1_2_cross_domain.csv',
+        help='CSV file for Experiment 1.2'
+    )
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='.',
+        help='Output directory for visualizations'
+    )
     
     args = parser.parse_args()
     
-    # Set style
-    sns.set_style("whitegrid")
-    plt.rcParams['figure.dpi'] = 100
-    plt.rcParams['savefig.dpi'] = 300
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("="*80)
+    print("Visualizing Experiment Results")
+    print("="*80)
     
     if args.experiment in ['1.1', 'both']:
-        csv_path = Path(args.csv_1_1)
-        if csv_path.exists():
-            print("\n" + "="*80)
-            print("Visualizing Experiment 1.1: Expert Activation Heatmaps")
-            print("="*80)
-            plot_experiment_1_1(str(csv_path), args.output_1_1)
-        else:
+        csv_path = args.csv_1_1
+        if not Path(csv_path).exists():
             print(f"Warning: CSV file not found: {csv_path}")
+        else:
+            output_path = output_dir / 'experiment_1_1_heatmap.png'
+            visualize_experiment_1_1(csv_path, str(output_path))
     
     if args.experiment in ['1.2', 'both']:
-        csv_path = Path(args.csv_1_2)
-        if csv_path.exists():
-            print("\n" + "="*80)
-            print("Visualizing Experiment 1.2: Cross-Domain Performance Drop")
-            print("="*80)
-            plot_experiment_1_2(str(csv_path), args.output_1_2)
-        else:
+        csv_path = args.csv_1_2
+        if not Path(csv_path).exists():
             print(f"Warning: CSV file not found: {csv_path}")
+        else:
+            output_path = output_dir / 'experiment_1_2_bar_chart.png'
+            visualize_experiment_1_2(csv_path, str(output_path))
     
     print("\n" + "="*80)
     print("Visualization complete!")

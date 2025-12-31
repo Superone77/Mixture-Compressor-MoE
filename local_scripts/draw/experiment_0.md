@@ -4,7 +4,7 @@ Goal: Prove that calibration data fails to activate deep-layer experts.
 
 Method:
 
-Take a pre-trained MoE model (e.g., Mixtral8x7B).
+Take a pre-trained MoE model (e.g., DeepSeekV2-Lite).
 
 Run inference on the WikiText2 calibration set.
 
