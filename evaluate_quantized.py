@@ -21,6 +21,7 @@ Example:
 
 import os
 import argparse
+import time
 import torch
 
 from transformers import AutoTokenizer
@@ -160,11 +161,18 @@ def main():
         print(f"\nEvaluating task: {task}")
         print("-" * 80)
         
+        # Profiling: measure simple_evaluate execution time
+        start_time = time.time()
         result = evaluator.simple_evaluate(
             model=lm,
             tasks=[task],
             batch_size=args.batch_size
         )
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        
+        # Print profiling information
+        print(f"\n[Profiling] simple_evaluate execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
         
         # Display results
         if 'results' in result and task in result['results']:
