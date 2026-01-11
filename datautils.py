@@ -167,6 +167,77 @@ def get_gsm8k(nsamples, seed, seqlen, model, tokenizer):
 
     return trainloader, testenc
 
+def get_mbpp(nsamples, seed, seqlen, model, tokenizer):
+    """Load MBPP and prepare calibration data using text + code."""
+    traindata = load_dataset("mbpp", "sanitized", split="train")
+    testdata = load_dataset("mbpp", "sanitized", split="test")
+
+    random.seed(seed)
+
+    def build_text(sample):
+        text = sample.get("text", "")
+        code = sample.get("code", "")
+        if text and code:
+            return f"{text}\n{code}"
+        return text or code
+
+    train_texts = [build_text(sample) for sample in traindata]
+    train_encodings = tokenizer(
+        train_texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+    )
+    input_ids_list = train_encodings["input_ids"]
+
+    eligible_indices = [idx for idx, ids in enumerate(input_ids_list) if len(ids) > seqlen]
+    if not eligible_indices:
+        concat_ids = []
+        for ids in input_ids_list:
+            concat_ids.extend(ids)
+            if len(concat_ids) > seqlen:
+                break
+        concat_tensor = torch.tensor(concat_ids, dtype=torch.long).unsqueeze(0)
+        start = 0
+        end = seqlen
+        inp = concat_tensor[:, start:end]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader = [(inp, tar)] * nsamples
+    else:
+        trainloader = []
+        for _ in range(nsamples):
+            idx = random.choice(eligible_indices)
+            ids = input_ids_list[idx]
+            max_start = len(ids) - seqlen - 1
+            s = random.randint(0, max(0, max_start))
+            e = s + seqlen
+            window = torch.tensor(ids[s:e], dtype=torch.long).unsqueeze(0)
+            inp = window
+            tar = inp.clone()
+            tar[:, :-1] = -100
+            trainloader.append((inp, tar))
+
+    test_size = min(1100, len(testdata))
+    test_texts = [build_text(testdata[i]) for i in range(test_size)]
+    test_enc = tokenizer(
+        test_texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+    )
+    flat_ids = []
+    for ids in test_enc["input_ids"]:
+        flat_ids.extend(ids)
+        if len(flat_ids) >= 256 * seqlen:
+            break
+    flat_tensor = torch.tensor(flat_ids[: 256 * seqlen], dtype=torch.long).unsqueeze(0)
+    testenc = TokenizerWrapper(flat_tensor)
+
+    return trainloader, testenc
+
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
     model_name = model.split('/')[-1]
     cache_file=f'/mnt/afs/yliao/Tasks/moe/Expert_Quant/moeq/cache/{name}_{nsamples}_{seed}_{seqlen}/Mixtral-8x7B-v0.1.pt'
@@ -186,6 +257,8 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model=''):
         loaders= get_c4(nsamples, seed, seqlen, model, tokenizer)
     if 'gsm8k' in name:
         loaders= get_gsm8k(nsamples, seed, seqlen, model, tokenizer)
+    if 'mbpp' in name:
+        loaders= get_mbpp(nsamples, seed, seqlen, model, tokenizer)
     if 'mix' in name:
         wiki_train,wiki_val=get_wikitext2(nsamples//3, seed, seqlen, model, tokenizer)
         ptb_train,ptb_val=get_ptb(nsamples//3, seed, seqlen, model, tokenizer)

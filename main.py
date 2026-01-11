@@ -591,8 +591,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["wikitext2", "ptb", "c4", "gsm8k", "mix"],
-        help="Where to extract calibration data from.",
+        choices=["wikitext2", "ptb", "c4", "gsm8k", "mbpp", "mix"],
+        help="Where to extract calibration data from (mbpp uses text + code per sample).",
     )
     parser.add_argument(
         "--gsm8k_field",
