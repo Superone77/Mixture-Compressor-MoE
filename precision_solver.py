@@ -1,6 +1,7 @@
 import pickle
 import os
 import argparse
+import csv
 
 import torch  
 import gurobipy as gp
@@ -28,6 +29,7 @@ class experts_ilp():
             weight_matrix = pickle.load(file)
         
         self.blocks = list(actnum_matrix.keys())
+        self.actnum_matrix_raw = actnum_matrix
         scale_factor = 1
         if norm_experts:
             actnum_matrix = self.norm_experts_dim(actnum_matrix)
@@ -96,12 +98,29 @@ class experts_ilp():
             final_opt_set[n] = opt_set
         return final_opt_set
 
+    def save_experts_csv(self, opt_set, csv_path, actnum_matrix=None):
+        if actnum_matrix is None:
+            actnum_matrix = self.actnum_matrix_raw
+        with open(csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["block", "expert", "activation_frequency", "assigned_precision"])
+            for block in sorted(actnum_matrix.keys()):
+                freqs = actnum_matrix[block]
+                for expert_id in range(self.num_experts):
+                    freq_val = freqs[expert_id]
+                    if torch.is_tensor(freq_val):
+                        freq_val = freq_val.item()
+                    else:
+                        freq_val = float(freq_val)
+                    writer.writerow([block, expert_id, freq_val, opt_set[block][expert_id]])
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Set ilp configs', add_help=False)
     parser.add_argument('--actnum_path', default='experts_act_frequency.pkl', type=str)
     parser.add_argument('--quant_loss_path', default='experts_quant_loss.pkl', type=str)
     parser.add_argument('--weight_path',default='experts_act_weight.pkl', type=str)
     parser.add_argument('--save_path',default='experts_mixture_bit_selection', type=str)
+    parser.add_argument('--csv_save_path', default=None, type=str)
     parser.add_argument('--alpha', default=1, type=float)
     parser.add_argument('--beta', default=1.5, type=float)
     parser.add_argument('--gama', default=2, type=float)
@@ -123,6 +142,9 @@ if __name__ == '__main__':
                                       norm_experts=True)
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
+    csv_save_path = args.csv_save_path or args.save_path
+    if not os.path.exists(csv_save_path):
+        os.makedirs(csv_save_path)
     for i in range(args.start_bitwidth, args.end_bitwidth):
         opt_set = experts_ilp_example.ilp_solver(i)
         # total bits of each MoE block, average bits can be calculated as total_bits / 8
@@ -130,3 +152,5 @@ if __name__ == '__main__':
         save_name = f"experts_mixture_bitwidth_combination_{total_bits}bit.pkl"
         with open(os.path.join(args.save_path, save_name), 'wb') as f:
             pickle.dump(opt_set, f) 
+        csv_name = f"experts_mixture_bitwidth_combination_{total_bits}bit.csv"
+        experts_ilp_example.save_experts_csv(opt_set, os.path.join(csv_save_path, csv_name))
