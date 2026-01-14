@@ -88,6 +88,7 @@ def llama_eval(model, testenc, dev,  dataset: str):
     print(f"Perplexity: {ppl.item():3f}")
 
     model.config.use_cache = use_cache
+    return ppl.item()
 
 @torch.no_grad()
 def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
