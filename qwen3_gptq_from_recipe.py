@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Qwen3-Coder-Next: load AlphaQ bit recipe (CSV), run GPTQ with per-layer/per-expert bit width,
-save quantized model for inference. Supports multi-GPU via device_map="auto".
+then save a **quantize-then-dequantize** model: weights are written back as float (dequantized),
+so the saved model is structurally identical to the original and loadable with from_pretrained.
+Supports gate/up separate bits (recipe entries ...expert_{e}.gate and ...expert_{e}.up).
+Supports multi-GPU via device_map="auto".
 
 Usage (on GPU machine):
   cd Mixture-Compressor-MoE
@@ -12,8 +15,8 @@ Usage (on GPU machine):
     --nsamples 128 --seqlen 2048 \
     --device_map auto
 
-Output: output_dir with config.json, model.safetensors (or pytorch_model.bin), tokenizer files.
-Inference: use inference_qwen3_quantized.py or AutoModelForCausalLM.from_pretrained(output_dir, device_map="auto").
+Output: output_dir with config.json, model.safetensors, tokenizer (same layout as original).
+Inference: same code for original or this output — AutoModelForCausalLM.from_pretrained(path).
 """
 
 import argparse
@@ -135,21 +138,41 @@ def run_gptq_qwen3_from_recipe(
         dev = next(layer.parameters()).device
 
         for e in range(gate_up.shape[0]):
+            name_gate = f"{prefix}mlp.experts.gate_up_proj.expert_{e}.gate"
+            name_up = f"{prefix}mlp.experts.gate_up_proj.expert_{e}.up"
             name_gu = f"{prefix}mlp.experts.gate_up_proj.expert_{e}"
-            bit = get_bit(name_gu)
-            if bit is None:
-                continue
-            W = gate_up.data[e].float().clone().to(dev)
-            wrapper = nn.Linear(gate_up.shape[2], gate_up.shape[1], bias=False, device=dev)
-            wrapper.weight.data = W.t().clone()
-            gptq = GPTQ(wrapper, logger, name_gu, bit)
-            gptq.quantizer.configure(bit, perchannel=True, sym=True, mse=False, pack=False)
-            out_flat = mlp_inp_flat @ W.t()
-            gptq.add_batch(mlp_inp_flat, out_flat)
-            gptq.fasterquant(blocksize=blocksize, percdamp=percdamp, groupsize=groupsize, actorder=actorder, name=name_gu)
-            q_w = wrapper.weight.data.t().clone()
-            experts.gate_up_proj.data[e] = q_w.to(experts.gate_up_proj.dtype).to(experts.gate_up_proj.device)
-            gptq.free()
+            bit_gate = get_bit(name_gate)
+            bit_up = get_bit(name_up)
+            bit_whole = get_bit(name_gu)
+            if bit_gate is not None and bit_up is not None:
+                W_full = gate_up.data[e].float().clone().to(dev)
+                W_gate = W_full[:inter]
+                W_up = W_full[inter:]
+                parts = []
+                for part_name, W_part, bit in [(name_gate, W_gate, bit_gate), (name_up, W_up, bit_up)]:
+                    wrapper = nn.Linear(W_part.shape[1], W_part.shape[0], bias=False, device=dev)
+                    wrapper.weight.data = W_part.t().clone()
+                    gptq = GPTQ(wrapper, logger, part_name, bit)
+                    gptq.quantizer.configure(bit, perchannel=True, sym=True, mse=False, pack=False)
+                    out_flat = mlp_inp_flat @ W_part.t()
+                    gptq.add_batch(mlp_inp_flat, out_flat)
+                    gptq.fasterquant(blocksize=blocksize, percdamp=percdamp, groupsize=groupsize, actorder=actorder, name=part_name)
+                    q_w = wrapper.weight.data.t().clone()
+                    parts.append(q_w)
+                    gptq.free()
+                experts.gate_up_proj.data[e] = torch.cat(parts, dim=0).to(experts.gate_up_proj.dtype).to(experts.gate_up_proj.device)
+            elif bit_whole is not None:
+                W = gate_up.data[e].float().clone().to(dev)
+                wrapper = nn.Linear(gate_up.shape[2], gate_up.shape[1], bias=False, device=dev)
+                wrapper.weight.data = W.t().clone()
+                gptq = GPTQ(wrapper, logger, name_gu, bit_whole)
+                gptq.quantizer.configure(bit_whole, perchannel=True, sym=True, mse=False, pack=False)
+                out_flat = mlp_inp_flat @ W.t()
+                gptq.add_batch(mlp_inp_flat, out_flat)
+                gptq.fasterquant(blocksize=blocksize, percdamp=percdamp, groupsize=groupsize, actorder=actorder, name=name_gu)
+                q_w = wrapper.weight.data.t().clone()
+                experts.gate_up_proj.data[e] = q_w.to(experts.gate_up_proj.dtype).to(experts.gate_up_proj.device)
+                gptq.free()
 
         for e in range(down.shape[0]):
             name_d = f"{prefix}mlp.experts.down_proj.expert_{e}"
@@ -240,10 +263,10 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Saving model and tokenizer to {out_dir}")
+    logger.info("Saving quantize-then-dequantize model (same structure as original, float weights) ...")
     model.save_pretrained(out_dir, safe_serialization=True)
     tokenizer.save_pretrained(out_dir)
-    logger.info("Done.")
+    logger.info("Done. Load with AutoModelForCausalLM.from_pretrained(output_dir) like the original.")
     return 0
 
 
